@@ -14,7 +14,7 @@ import os
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 IMAGE = "{{ELEUSIS_IMAGE}}"
-SOURCE_URL = "https://github.com/Metta-AI/cogame-eleusis/tree/main"
+SOURCE_URL = "https://github.com/softmax-universe/cogame-eleusis/tree/main"
 SEATS = 5
 
 CATALOGUE = """| # | kind | parameters | instances | PASS iff |
