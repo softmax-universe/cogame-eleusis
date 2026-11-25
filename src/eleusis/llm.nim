@@ -404,8 +404,10 @@ proc replyHead(text: string): string =
 
 proc extractJsonObject*(text: string): JsonNode =
   ## Parses exactly one JSON object: either bare or inside a single ordinary
-  ## outer Markdown code fence (plain or json-tagged). Rejects surrounding
-  ## prose, extra objects, unsupported fence tags, and non-object JSON.
+  ## outer Markdown code fence (plain or json-tagged, with optional closing
+  ## backticks when the fenced body is a complete JSON object). Rejects
+  ## surrounding prose, extra objects, truncated or malformed JSON, unsupported
+  ## fence tags, and non-object JSON.
   let trimmed = text.strip()
   if trimmed.len == 0:
     raise newException(EleusisError, "no JSON object in response")
@@ -420,15 +422,15 @@ proc extractJsonObject*(text: string): JsonNode =
       raise newException(EleusisError,
         "unsupported markdown code fence in response: " & openLine)
     let rest = trimmed[nl + 1 .. ^1]
-    if not rest.endsWith("```"):
-      raise newException(EleusisError,
-        "unclosed markdown code fence in response: " & replyHead(text))
-    let beforeClose = rest[0 ..< rest.len - 3].strip(
-      leading = false, trailing = true, chars = {' ', '\t'})
-    if beforeClose.len > 0 and beforeClose[^1] notin {'\n', '\r'}:
-      raise newException(EleusisError,
-        "closing markdown fence must be on its own line: " & replyHead(text))
-    body = beforeClose.strip()
+    if rest.endsWith("```"):
+      let beforeClose = rest[0 ..< rest.len - 3].strip(
+        leading = false, trailing = true, chars = {' ', '\t'})
+      if beforeClose.len > 0 and beforeClose[^1] notin {'\n', '\r'}:
+        raise newException(EleusisError,
+          "closing markdown fence must be on its own line: " & replyHead(text))
+      body = beforeClose.strip()
+    else:
+      body = rest.strip()
   if not (body.startsWith("{") and body.endsWith("}")):
     raise newException(EleusisError,
       "response must be a single JSON object: " & replyHead(text))
