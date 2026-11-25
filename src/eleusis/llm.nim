@@ -5,10 +5,10 @@
 ## publishes what it is holding.
 ##
 ## Every seat decides SIMULTANEOUSLY by rule, so all five requests go out as
-## ONE parallel batch per turn (curly.makeRequests); invalid replies are
-## retried once as a smaller batch with a hint, and anything still failing
-## is surfaced as a seat or infrastructure failure rather than silently
-## replaced with a scripted move.
+## ONE parallel batch per turn (curly.makeRequests); any invalid reply or
+## provider/transport failure is surfaced immediately as a seat or
+## infrastructure failure without retrying model calls or silently replacing
+## the decision with a scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -606,7 +606,6 @@ proc decideAll*(
   result = newSeq[Decision](seats.len)
   let testing = sim.phase == phTest
   var open: seq[int]     ## indexes into `seats` still undecided
-  var lastFailureKind = newSeq[FailureKind](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
     if client.playsScripted(prompts[seat], kind):
@@ -621,21 +620,17 @@ proc decideAll*(
       result[index].failureReason = "no LLM credentials configured"
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
+  if open.len > 0 and not client.disabled:
     var batch: RequestBatch
     var evidenceBatch: seq[DecisionAttempt]
     for index in open:
       let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\n\nYour previous reply was invalid. Respond with ONLY " &
-          "the requested JSON object and nothing else.")
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
-      var evidence = newDecisionAttempt($sim.round & "-" & $sim.phase & "-" & $seat & "-" & $attempt,
+      let system = systemPrompt(sim, seat, selection)
+      let user = sim.userPrompt(seat, prompts[seat])
+      let request = client.requestFor(system, user, seat)
+      var evidence = newDecisionAttempt($sim.round & "-" & $sim.phase & "-" & $seat & "-0",
         "prompt", aoModel)
-      evidence.prompt = %*[{"role": "system", "content": systemPrompt(sim, seat, selection)},
+      evidence.prompt = %*[{"role": "system", "content": system},
         {"role": "user", "content": user}]
       evidence.request = parseJson(request.body)
       evidence.decoder = %*{"max_tokens": client.maxOutputTokens}
@@ -647,7 +642,6 @@ proc decideAll*(
       batch.post(request.url, request.headers, request.body, $index)
     let started = epochTime()
     let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    var stillOpen: seq[int]
     for position, index in open:
       let seat = seats[index]
       var evidence = evidenceBatch[position]
@@ -670,8 +664,7 @@ proc decideAll*(
         var decision = parseDecision(extractJsonObject(text),
           sim.config.testStrips, testing)
         evidence.parsedAction = decisionJson(decision, testing)
-        ## Reject illegal replies HERE so the retry carries the hint and an
-        ## illegal move never reaches the real sim.
+        ## Reject illegal replies HERE so an illegal move never reaches the real sim.
         var probe = sim
         if testing:
           probe.applyAnswers(seat, decision.answers, decision.publish,
@@ -680,31 +673,20 @@ proc decideAll*(
           probe.applyResearch(seat, decision.strip, decision.publish,
             decision.hypothesis, decision.notes, false)
         evidence.accepted = true
-        decision.attempts = result[index].attempts & @[evidence]
+        decision.attempts = @[evidence]
         decision.selectedAttemptId = some(evidence.attemptId)
         result[index] = decision
       except LlmInfraError as error:
         evidence.rejectionReason = some(error.msg)
         result[index].attempts.add(evidence)
-        lastFailureKind[index] = fkInfra
-        echo "eleusis llm: seat ", seat, " attempt ", attempt, " infra error: ",
-          error.msg
-        stillOpen.add(index)
+        result[index].failed = true
+        result[index].failureKind = fkInfra
+        result[index].failureReason = error.msg
+        echo "eleusis llm: seat ", seat, " infra error: ", error.msg
       except CatchableError as error:
         evidence.rejectionReason = some(error.msg)
         result[index].attempts.add(evidence)
-        lastFailureKind[index] = fkPlayer
-        echo "eleusis llm: seat ", seat, " attempt ", attempt, " failed: ",
-          error.msg
-        stillOpen.add(index)
-    open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    var reason = "no valid model reply"
-    if result[index].attempts.len > 0 and result[index].attempts[^1].rejectionReason.isSome:
-      reason = result[index].attempts[^1].rejectionReason.get()
-    let kind = if lastFailureKind[index] != fkNone: lastFailureKind[index] else: fkInfra
-    echo "eleusis llm: seat ", seat, " failed (", kind, "): ", reason
-    result[index].failed = true
-    result[index].failureKind = kind
-    result[index].failureReason = reason
+        result[index].failed = true
+        result[index].failureKind = fkPlayer
+        result[index].failureReason = error.msg
+        echo "eleusis llm: seat ", seat, " failed: ", error.msg

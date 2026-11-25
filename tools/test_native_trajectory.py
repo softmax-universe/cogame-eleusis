@@ -20,6 +20,7 @@ for mode in (
     "invalid",
     "double-object",
     "provider-429",
+    "provider-503",
     "provider-error",
     "missing-credentials",
     "normalized",
@@ -70,6 +71,9 @@ for mode in (
             if mode == "provider-error" and seat == 0:
                 status_code = 500
                 body = {"error": {"message": "fixture provider error"}}
+            elif mode == "provider-503" and seat == 2:
+                status_code = 503
+                body = {"error": {"message": "fixture service unavailable"}}
             elif mode == "provider-429" and seat == 0:
                 status_code = 429
                 body = {"error": {"message": "fixture rate limited"}}
@@ -141,9 +145,10 @@ for mode in (
     else:
         env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{provider.server_port}"
         env["COWORLD_LLM_MODEL"] = "fixture/requested"
-    failed_modes = {"invalid", "double-object", "provider-429", "provider-error", "missing-credentials"}
+    failed_modes = {"invalid", "double-object", "provider-429", "provider-503", "provider-error", "missing-credentials"}
     player_fail_modes = {"invalid", "double-object"}
-    infra_fail_modes = {"provider-429", "provider-error", "missing-credentials"}
+    infra_fail_modes = {"provider-429", "provider-503", "provider-error", "missing-credentials"}
+    expected_fail_seat = 2 if mode == "provider-503" else 0
     processes = []
     try:
         with (output / "game.log").open("w") as log:
@@ -194,21 +199,25 @@ for mode in (
             assert events[-1]["participant_outcomes"] == {}
             assert "scores" not in events[-1]["outcome"]
             assert events[-1]["outcome"]["rounds"] == 0
+            assert failure_path.exists(), f"{mode}: COGAME_PLAYER_FAILURE_URI must be written on failure"
+            failure_info = json.loads(failure_path.read_text())
+            assert set(failure_info.keys()) == {"failed_policy_index", "message", "kind"}
+            assert failure_info["failed_policy_index"] == expected_fail_seat
+            assert isinstance(failure_info["message"], str) and 1 <= len(failure_info["message"]) <= 2000
             if mode in player_fail_modes:
                 assert events[-1]["outcome"]["failureKind"] == "player"
-                assert failure_path.exists(), f"{mode}: COGAME_PLAYER_FAILURE_URI must be written for player failure"
-                failure_info = json.loads(failure_path.read_text())
-                assert failure_info["seat"] == 0 and failure_info["player"] == "p0"
-                assert failure_info["reason"]
+                assert failure_info["kind"] == "player_error"
             else:
                 assert events[-1]["outcome"]["failureKind"] == "infra"
-                assert not failure_path.exists(), f"{mode}: COGAME_PLAYER_FAILURE_URI must NOT be written for infra failure"
+                assert failure_info["kind"] == "episode_inconclusive"
                 if mode == "provider-429":
-                    assert "429" in diag["reason"]
+                    assert "429" in diag["reason"] and "429" in failure_info["message"]
+                elif mode == "provider-503":
+                    assert "503" in diag["reason"] and "503" in failure_info["message"]
                 elif mode == "provider-error":
-                    assert "500" in diag["reason"]
+                    assert "500" in diag["reason"] and "500" in failure_info["message"]
                 elif mode == "missing-credentials":
-                    assert "credentials" in diag["reason"]
+                    assert "credentials" in diag["reason"] and "credentials" in failure_info["message"]
         else:
             assert not failure_path.exists()
             assert results_path.exists() and replay_path.exists()
@@ -313,9 +322,9 @@ for mode in (
                 assert event["selected_attempt_id"] is None
                 assert event["executed_action"] is None
                 assert event["fallback_origin"] is None
-                if event["seat"] == "0":
+                if event["seat"] == str(expected_fail_seat):
                     assert event["action_status"] == "rejected"
-                    assert len(event["attempts"]) == 2
+                    assert len(event["attempts"]) == 1
                 else:
                     assert event["action_status"] == "missing"
             elif mode in infra_fail_modes:
@@ -323,8 +332,8 @@ for mode in (
                 assert event["executed_action"] is None
                 assert event["fallback_origin"] is None
                 assert event["action_status"] == "missing"
-                if mode != "missing-credentials" and event["seat"] == "0":
-                    assert len(event["attempts"]) == 2
+                if mode != "missing-credentials" and event["seat"] == str(expected_fail_seat):
+                    assert len(event["attempts"]) == 1
             elif mode == "applied-text" and event["seat"] == "0":
                 assert event["action_status"] == "rejected"
                 assert event["selected_attempt_id"] is None
