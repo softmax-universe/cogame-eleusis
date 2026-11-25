@@ -30,6 +30,7 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
+  DefaultBedrockModel = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 type
   LlmInfraError* = object of EleusisError
@@ -66,11 +67,9 @@ type
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModel: string    ## single Bedrock inference profile id (no silent fallback)
     bedrockToken: string
-    model: string         ## direct-Anthropic transport only; Bedrock
-                          ## picks from bedrockModels instead
+    model: string         ## direct-Anthropic or sidecar transport model
     maxOutputTokens: int
     timeoutSeconds: int
     disabled*: bool   ## true once credentials are known-unavailable
@@ -98,40 +97,16 @@ proc resolveApiKey(): string =
     echo "eleusis llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL pins
-  ## a single id; without it, fall through this list — model access is a
-  ## per-account Marketplace subscription, so an id that works in one account
-  ## 403s in another. Haiku leads: hosted Bedrock capacity is shared
-  ## account-wide and the sonnet profiles run out of daily tokens first.
-  ## `us.anthropic.claude-sonnet-4-6` is deliberately NOT a candidate: it
-  ## times out on every sidecar call, and one throttle then cascades into
-  ## scripted fallbacks (cogame-raid, 2026-08-23).
-  ## The config "model" field is NOT consulted here: it applies to
-  ## the direct-Anthropic transport only, and the haiku-first
-  ## ordering is a shared-capacity decision that trumps per-game
-  ## preference.
+proc bedrockModelId(): string =
+  ## Bedrock inference-profile id. BEDROCK_MODEL pins an explicit id;
+  ## otherwise use DefaultBedrockModel with no implicit alternate fallback.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "eleusis llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  DefaultBedrockModel
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModel & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -159,11 +134,11 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModel = bedrockModelId()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "eleusis llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel],
+      result.bedrockModel,
       ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
@@ -501,22 +476,17 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
   ## The text of one batched reply, or an error describing why there is none.
   ## Transport/HTTP/provider errors raise LlmInfraError; model refusals and
-  ## cutoffs raise EleusisError. Auth failures disable the client; model-access
-  ## and throttle failures rotate the Bedrock model for the next batch.
+  ## cutoffs raise EleusisError. Auth failures disable the client; no silent
+  ## model rotation occurs on access denial or throttling.
   if error.len > 0:
     raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(LlmInfraError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
     raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
     raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     raise newException(LlmInfraError, "anthropic error " & $response.code &

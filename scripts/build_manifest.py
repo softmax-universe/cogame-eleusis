@@ -641,7 +641,10 @@ MANIFEST = {
             "type": "game",
             "image": IMAGE,
             "run": ["/bin/eleusis"],
-            "env": {},
+            "env": {
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
             "source_url": SOURCE_URL,
         },
         "config_schema": CONFIG_SCHEMA,
@@ -674,6 +677,10 @@ MANIFEST = {
             "default version-space strategy in words) to the game and "
             "spectates until the final frame. Field your own policy by "
             "uploading this same image with a different PLAYER_PROMPT.",
+            env={
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
         ),
         player(
             "eleusis-openbook",
@@ -732,15 +739,15 @@ MANIFEST = {
             "minBatchSpacingMs": 0,
             "player_connect_timeout_seconds": 180,
         },
-        # Purely scripted offline certification: deterministic baseline seats
-        # selected by ID so offline certification completes without LLM
-        # credentials or silent fallbacks.
+        # EVERY declared player runnable occupies at least one slot: a fixture
+        # that seats only baselines fails certification's players-run check
+        # with players_missing (raid 0.1.2 -> 0.1.3, 2026-08-23).
         "players": [
+            {"player_id": "eleusis-player"},
             {"player_id": "eleusis-openbook"},
+            {"player_id": "eleusis-player"},
             {"player_id": "eleusis-hoarder"},
-            {"player_id": "eleusis-openbook"},
-            {"player_id": "eleusis-hoarder"},
-            {"player_id": "eleusis-openbook"},
+            {"player_id": "eleusis-player"},
         ],
     },
 }

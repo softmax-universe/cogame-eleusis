@@ -24,7 +24,10 @@
       "run": [
         "/bin/eleusis"
       ],
-      "env": {},
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "source_url": "https://github.com/softmax-universe/cogame-eleusis/tree/main"
     },
     "config_schema": {
@@ -402,6 +405,10 @@
       "run": [
         "/bin/eleusis-player"
       ],
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "resources": {
         "requests": {
           "cpu": "100m",
@@ -591,19 +598,19 @@
     },
     "players": [
       {
+        "player_id": "eleusis-player"
+      },
+      {
         "player_id": "eleusis-openbook"
+      },
+      {
+        "player_id": "eleusis-player"
       },
       {
         "player_id": "eleusis-hoarder"
       },
       {
-        "player_id": "eleusis-openbook"
-      },
-      {
-        "player_id": "eleusis-hoarder"
-      },
-      {
-        "player_id": "eleusis-openbook"
+        "player_id": "eleusis-player"
       }
     ]
   }
