@@ -77,6 +77,10 @@ when isMainModule:
           echo "eleusis player: final scores ", payload{"scores"}
           echo "eleusis player: the rule was ", payload{"rule"}.getStr()
           break
+        of "error":
+          echo "eleusis player: episode aborted (",
+            payload{"failureKind"}.getStr(), "): ", payload{"reason"}.getStr()
+          break
         else:
           discard
       except CatchableError as error:

@@ -7,19 +7,17 @@
 ## Every seat decides SIMULTANEOUSLY by rule, so all five requests go out as
 ## ONE parallel batch per turn (curly.makeRequests); invalid replies are
 ## retried once as a smaller batch with a hint, and anything still failing
-## is surfaced as a seat failure/forfeit rather than silently replaced with a
-## scripted move.
+## is surfaced as a seat or infrastructure failure rather than silently
+## replaced with a scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal scripted
-## baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## Explicit scripted seats (`openbook`, `hoarder`, `freerider`) run
+## deterministically without LLM credentials; LLM-driven seats require valid
+## credentials and fail as an infrastructure error when none are configured.
 
 import
   std/[json, options, os, random, sets, strutils, times, unicode],
@@ -34,6 +32,13 @@ const
   BedrockAnthropicVersion = "bedrock-2023-05-31"
 
 type
+  LlmInfraError* = object of EleusisError
+
+  FailureKind* = enum
+    fkNone = "none"
+    fkPlayer = "player"
+    fkInfra = "infra"
+
   ScriptKind* = enum
     skNone = "none"
     skOpenbook = "openbook"
@@ -49,6 +54,7 @@ type
     hypothesis*: string
     notes*: string          ## "" when the reply carried none
     failed*: bool           ## true when the seat failed to produce a valid decision
+    failureKind*: FailureKind ## player-attributable vs infrastructure failure
     failureReason*: string  ## diagnostic reason when failed == true
 
   LlmTransport = enum
@@ -168,7 +174,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "eleusis llm: no LLM credentials; using scripted fallback"
+    echo "eleusis llm: no LLM credentials configured"
 
 # ---- Scripted baselines -----------------------------------------------------
 #
@@ -493,28 +499,37 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or an EleusisError describing why there
-  ## is none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+  ## The text of one batched reply, or an error describing why there is none.
+  ## Transport/HTTP/provider errors raise LlmInfraError; model refusals and
+  ## cutoffs raise EleusisError. Auth failures disable the client; model-access
+  ## and throttle failures rotate the Bedrock model for the next batch.
   if error.len > 0:
-    raise newException(EleusisError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(EleusisError,
+      raise newException(LlmInfraError,
         "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(EleusisError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
     discard client.tryNextBedrockModel("throttled")
-    raise newException(EleusisError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(EleusisError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "anthropic error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as parseErr:
+    raise newException(LlmInfraError,
+      "invalid provider response JSON: " & parseErr.msg)
+  if payload.kind != JObject or not payload.hasKey("content") or
+      payload["content"].kind != JArray:
+    raise newException(LlmInfraError, "provider response missing content array")
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(EleusisError, "anthropic refusal")
   for contentBlock in payload["content"]:
@@ -601,9 +616,9 @@ proc decisionJson*(decision: Decision, testing: bool): JsonNode =
 
 proc playsScripted*(client: LlmClient, prompt: string,
     kind: ScriptKind): bool =
-  ## A seat plays a built-in baseline instead of Claude when it registered as
-  ## scripted or when there are no LLM credentials at all (offline certification).
-  kind != skNone or client.disabled
+  ## A seat plays a built-in baseline ONLY when it explicitly registered as
+  ## scripted. LLM seats never silently fall back to a scripted move.
+  kind != skNone
 
 proc decideAll*(
   client: LlmClient,
@@ -615,20 +630,25 @@ proc decideAll*(
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — all of them as ONE parallel
   ## batch, because every seat decides simultaneously by rule. Any seat that
-  ## fails to produce a valid decision is marked `failed = true` instead of
-  ## silently substituting a scripted move. `prompts` and `scripted` are indexed
-  ## by SEAT.
+  ## fails to produce a valid decision is marked `failed = true` with an
+  ## explicit `failureKind` (fkPlayer vs fkInfra) instead of silently
+  ## substituting a scripted move. `prompts` and `scripted` are indexed by SEAT.
   result = newSeq[Decision](seats.len)
   let testing = sim.phase == phTest
   var open: seq[int]     ## indexes into `seats` still undecided
+  var lastFailureKind = newSeq[FailureKind](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
     if client.playsScripted(prompts[seat], kind):
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skOpenbook else: kind))
+      result[index] = scriptedAction(sim, seat, kind)
     elif prompts[seat].strip().len == 0:
       result[index].failed = true
+      result[index].failureKind = fkPlayer
       result[index].failureReason = "no prompt delivered for seat"
+    elif client.disabled:
+      result[index].failed = true
+      result[index].failureKind = fkInfra
+      result[index].failureReason = "no LLM credentials configured"
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -693,9 +713,17 @@ proc decideAll*(
         decision.attempts = result[index].attempts & @[evidence]
         decision.selectedAttemptId = some(evidence.attemptId)
         result[index] = decision
+      except LlmInfraError as error:
+        evidence.rejectionReason = some(error.msg)
+        result[index].attempts.add(evidence)
+        lastFailureKind[index] = fkInfra
+        echo "eleusis llm: seat ", seat, " attempt ", attempt, " infra error: ",
+          error.msg
+        stillOpen.add(index)
       except CatchableError as error:
         evidence.rejectionReason = some(error.msg)
         result[index].attempts.add(evidence)
+        lastFailureKind[index] = fkPlayer
         echo "eleusis llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
         stillOpen.add(index)
@@ -705,6 +733,8 @@ proc decideAll*(
     var reason = "no valid model reply"
     if result[index].attempts.len > 0 and result[index].attempts[^1].rejectionReason.isSome:
       reason = result[index].attempts[^1].rejectionReason.get()
-    echo "eleusis llm: seat ", seat, " failed to produce a valid decision: ", reason
+    let kind = if lastFailureKind[index] != fkNone: lastFailureKind[index] else: fkInfra
+    echo "eleusis llm: seat ", seat, " failed (", kind, "): ", reason
     result[index].failed = true
+    result[index].failureKind = kind
     result[index].failureReason = reason

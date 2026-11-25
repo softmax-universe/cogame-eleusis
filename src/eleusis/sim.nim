@@ -816,10 +816,10 @@ proc applyAnswers*(sim: var Sim, seat: int, answers: seq[Verdict],
   sim.discloseNow(seat, publish)
   sim.recordAnswer(seat, answers, scripted, fallback)
 
-proc endEarly*(sim: var Sim, reason = "deadline") =
-  ## Stop now, between batches (on episode deadline or player forfeit). An open
-  ## test that was never fully answered is discarded unscored; tests already
-  ## settled keep their money; a result a seat is still holding stays hoarded.
+proc endEarly*(sim: var Sim) =
+  ## Stop now, between batches (on episode deadline). An open test that was
+  ## never fully answered is discarded unscored; tests already settled keep
+  ## their money; a result a seat is still holding stays hoarded.
   if sim.done:
     return
   ## A result a seat is still holding when the clock stops stays HOARDED: it
@@ -845,7 +845,7 @@ proc endEarly*(sim: var Sim, reason = "deadline") =
     ## stamps and correctness pips on `open`, so without this flag a
     ## discarded test would be revealed as though it had been marked.
     sim.test.discarded = true
-  sim.settle(reason)
+  sim.settle("deadline")
 
 # ---- Results ----------------------------------------------------------------
 
@@ -1238,12 +1238,12 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[Sim] =
         sim.events.add(event)
     of evEnd:
       if not sim.done:
-        ## A deadline or forfeit stop is not derivable from the decisions alone;
+        ## A deadline stop is not derivable from the decisions alone;
         ## a recorded "complete" that the rules did not reach is a tamper.
-        if event.text notin ["deadline", "forfeit"]:
+        if event.text != "deadline":
           raise newException(EleusisError,
             "the recorded ending does not match the re-derivation")
-        sim.endEarly(event.text)
+        sim.endEarly()
       if sim.reason != event.text:
         raise newException(EleusisError,
           "the recorded ending does not match the re-derivation")

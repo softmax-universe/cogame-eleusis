@@ -131,7 +131,7 @@ suite "scripted baselines":
     check sim.seats[0].spend == 0
     check sim.seats[0].answered == 3 * sim.config.testStrips
 
-  test "decideAll falls back to scripted with no credentials":
+  test "decideAll plays explicit scripted seats without credentials and fails LLM seats as infra":
     let config = fixture(3, rounds = 8, testEvery = 4)
     let client = newLlmClient(config)
     client.disabled = true
@@ -139,16 +139,24 @@ suite "scripted baselines":
     var sim = initSim(config)
     let seats = sim.pendingSeats()
     let decisions = client.decideAll(sim, seats,
-      @["be bold", "", "", "", ""],
+      @["be bold", "play smart", "", "", ""],
       @[skNone, skNone, skHoarder, skNone, skOpenbook], PromptSelection())
     check decisions.len == Seats
-    for index, seat in seats:
+    ## Explicit scripted seats still produce legal baseline moves.
+    for seat in [2, 4]:
       let kind = if seat == 2: skHoarder else: skOpenbook
-      check decisions[index].strip == scriptedAction(sim, seat, kind).strip
-      check decisions[index].publish == (seat != 2)
-      sim.applyResearch(seat, decisions[index].strip, decisions[index].publish,
-        decisions[index].hypothesis, decisions[index].notes, true)
-    check sim.round == 2
+      check not decisions[seat].failed
+      check decisions[seat].strip == scriptedAction(sim, seat, kind).strip
+      check decisions[seat].publish == (seat != 2)
+    ## Connected LLM seats with prompts fail as infra when credentials are missing.
+    for seat in [0, 1]:
+      check decisions[seat].failed
+      check decisions[seat].failureKind == fkInfra
+      check decisions[seat].failureReason == "no LLM credentials configured"
+    ## An LLM seat with no prompt delivered fails as player-attributable.
+    check decisions[3].failed
+    check decisions[3].failureKind == fkPlayer
+    check decisions[3].failureReason == "no prompt delivered for seat"
 
   test "a slot that never delivered a prompt fails instead of silently playing openbook":
     putEnv("ANTHROPIC_API_KEY", "not-a-real-key")
@@ -162,6 +170,7 @@ suite "scripted baselines":
     check decisions.len == Seats
     for index, seat in seats:
       check decisions[index].failed
+      check decisions[index].failureKind == fkPlayer
       check decisions[index].failureReason.len > 0
       check decisions[index].attempts.len == 0
     delEnv("ANTHROPIC_API_KEY")
