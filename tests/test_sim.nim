@@ -543,15 +543,11 @@ suite "replay":
     check shortFrames[^1].roundsPlayed == 1
     ## Including the results the seats were still holding when it stopped.
     check $shortFrames[^1].benchStateJson() == $short.benchStateJson()
-    ## A recorded forfeit stop is honoured identically.
-    var forfeited = initSim(config)
-    forfeited.researchAll(offset = 3)
-    forfeited.endEarly("forfeit")
-    let forfeitFrames = replayMatch(config, forfeited.events)
-    check forfeitFrames[^1].done
-    check forfeitFrames[^1].reason == "forfeit"
-    check forfeitFrames[^1].roundsPlayed == 1
-    check $forfeitFrames[^1].benchStateJson() == $forfeited.benchStateJson()
+    ## Non-deadline early endings (such as an invented forfeit) are rejected.
+    var badEndEvents = short.events
+    badEndEvents[^1].text = "forfeit"
+    expect EleusisError:
+      discard replayMatch(config, badEndEvents)
 
   test "a tampered test event is rejected":
     let config = fixtureConfig(rounds = 4, seed = 11, testEvery = 4)

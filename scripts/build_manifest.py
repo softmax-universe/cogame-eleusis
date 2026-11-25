@@ -60,8 +60,10 @@ chosen rule's PASS fraction over all 256 strips always lies in [0.10, 0.90].
    instant.
 2. **Collect decisions.** All five seats' requests go out as ONE parallel LLM
    batch. A reply is `{{"experiment", "publish", "hypothesis", "notes"}}`. A
-   reply that times out, fails to parse, or is illegal is retried once with a
-   hint, then replaced by the `openbook` scripted decision for that seat.
+   reply that fails to parse or is illegal is retried once with a hint; if a
+   seat still fails to supply a valid decision or the provider fails, the
+   unfinished episode aborts unscored with attributable diagnostics instead of
+   substituting a scripted move.
 3. **Disclosure of the pending result**, per seat in seat order. Disclosure is
    pipelined by one turn — you pay, you look at your private verdict, and you
    decide what to do with it on your NEXT turn, by which time the corkboard
@@ -194,8 +196,7 @@ DESCRIPTION = (
     "A POLICY IS JUST A PROMPT: build one by reusing the published player "
     "runnable with PLAYER_PROMPT set to your strategy. Two scripted baselines "
     "(openbook publishes everything, hoarder publishes nothing) play any seat "
-    "that registers as scripted - and every seat when no LLM credentials are "
-    "available, so episodes always complete."
+    "that registers explicitly as scripted via PLAYER_SCRIPTED."
 )
 
 README = (
@@ -211,9 +212,9 @@ README = (
     "your rivals for the pool; hoard and you earn no citations. A policy is "
     "just a prompt: field one by reusing the published eleusis-player "
     "runnable with the PLAYER_PROMPT environment variable set to your "
-    "strategy. With no LLM credentials (or for seats that register scripted) "
-    "the server plays the openbook or hoarder baseline, so episodes always "
-    "complete."
+    "strategy. Seats that register explicitly as scripted via PLAYER_SCRIPTED "
+    "play the openbook, hoarder, or freerider baseline deterministically "
+    "without an LLM."
 )
 
 PLAYER_PROTOCOL = (
@@ -562,12 +563,11 @@ RESULTS_SCHEMA = {
         "reason": {
             "description": (
                 "How the episode ended: complete (the test after the final "
-                "round settled), deadline (the play clock stopped it "
-                "between batches; settled tests keep their money), or forfeit "
-                "(a player failed to provide a valid action)."
+                "round settled) or deadline (the play clock stopped it "
+                "between batches; settled tests keep their money)."
             ),
             "type": "string",
-            "enum": ["complete", "deadline", "forfeit"],
+            "enum": ["complete", "deadline"],
         },
     },
 }
@@ -641,7 +641,10 @@ MANIFEST = {
             "type": "game",
             "image": IMAGE,
             "run": ["/bin/eleusis"],
-            "env": {},
+            "env": {
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
             "source_url": SOURCE_URL,
         },
         "config_schema": CONFIG_SCHEMA,
@@ -674,6 +677,10 @@ MANIFEST = {
             "default version-space strategy in words) to the game and "
             "spectates until the final frame. Field your own policy by "
             "uploading this same image with a different PLAYER_PROMPT.",
+            env={
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
         ),
         player(
             "eleusis-openbook",

@@ -57,6 +57,7 @@ type
     pendingErrors: seq[string]
     pendingRejectedActions: seq[JsonNode]
     failureSeat: int
+    failureKind: FailureKind
     failureReason: string
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
@@ -213,6 +214,68 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   for frame in replayMatch(config, events):
     result.add(frame.benchStateJson())
 
+proc abortEpisode(runtimeConfig: RuntimeConfig) =
+  ## Terminates an unfinished episode unscored with attributable diagnostics.
+  ## Never writes authoritative scores (results.json) or a synthetic replay.
+  ## Writes COGAME_PLAYER_FAILURE_URI ONLY for player-attributable failures.
+  var failureSeat = -1
+  var failureKind = fkNone
+  var failureReason = ""
+  var failurePlayer = ""
+  var diagnosticText = ""
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    failureSeat = state.failureSeat
+    failureKind = state.failureKind
+    failureReason = state.failureReason
+    if failureSeat >= 0 and failureSeat < state.config.players.len:
+      failurePlayer = state.config.players[failureSeat].name
+    let diagnostic = %*{
+      "status": "failed",
+      "failureKind": $failureKind,
+      "seat": failureSeat,
+      "player": failurePlayer,
+      "reason": failureReason,
+      "rounds": state.sim.roundsPlayed,
+      "tests": state.sim.testsDone
+    }
+    diagnosticText = $diagnostic
+    if not state.trajectory.isNil:
+      state.trajectory.finish(esFailed, diagnostic, newJObject())
+    let errFrame = $ %*{
+      "type": "error",
+      "failureKind": $failureKind,
+      "seat": failureSeat,
+      "reason": failureReason
+    }
+    for _, socket in state.playerSockets:
+      try:
+        socket.send(errFrame)
+      except CatchableError:
+        discard
+
+  sleep(100)
+  if not state.trajectory.isNil:
+    state.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureKind == fkPlayer and failureSeat >= 0 and failureUri.len > 0:
+    let failurePayload = $ %*{
+      "seat": failureSeat,
+      "player": failurePlayer,
+      "reason": failureReason
+    }
+    writeArtifact(
+      failureUri, failurePayload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
+  if runtimeConfig.logUri.len > 0:
+    writeLog(runtimeConfig, diagnosticText & "\n")
+  echo "eleusis: episode aborted unscored (", failureKind, ", seat ",
+    failureSeat, "): ", failureReason
+  quit(1)
+
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
@@ -227,9 +290,7 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
       for seat in 0 ..< Seats:
         participants[$seat] = %*{"score": results["scores"][seat]}
       let episodeStatus =
-        case results["reason"].getStr()
-        of "complete": esCompleted
-        of "forfeit": esFailed
+        if results["reason"].getStr() == "complete": esCompleted
         else: esTruncated
       state.trajectory.finish(episodeStatus, results, participants)
 
@@ -259,17 +320,6 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   sleep(500)
   if not state.trajectory.isNil:
     state.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
-  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
-  if state.failureSeat >= 0 and failureUri.len > 0:
-    let failurePayload = $ %*{
-      "seat": state.failureSeat,
-      "player": state.config.players[state.failureSeat].name,
-      "reason": state.failureReason
-    }
-    writeArtifact(
-      failureUri, failurePayload, "application/json",
-      "COGAME_PLAYER_FAILURE_METHOD"
-    )
   echo "eleusis: writing results and replay"
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
@@ -438,9 +488,11 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             evidence.rejectionReason = some(errMsg)
             decisions[index].attempts.add(evidence)
             decisions[index].failed = true
+            decisions[index].failureKind = fkPlayer
             decisions[index].failureReason = errMsg
           elif action.isNil:
             decisions[index].failed = true
+            decisions[index].failureKind = fkPlayer
             decisions[index].failureReason = "external player did not submit an action"
           else:
             try:
@@ -454,20 +506,23 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               evidence.rejectionReason = some(error.msg)
               decisions[index].attempts.add(evidence)
               decisions[index].failed = true
+              decisions[index].failureKind = fkPlayer
               decisions[index].failureReason = error.msg
 
-      var batchForfeited = false
+      var batchFailed = false
       withLock stateLock:
         var failedSeat = -1
+        var failedKind = fkNone
         var failedReason = ""
         for index, seat in seats:
           if decisions[index].failed:
             failedSeat = seat
+            failedKind = decisions[index].failureKind
             failedReason = decisions[index].failureReason
             break
         if failedSeat < 0:
           ## Validate every seat's decision against the sim before mutating state
-          ## so a rejected reply forfeits cleanly without half-applying the round.
+          ## so a rejected reply aborts cleanly without half-applying the round.
           var probe = state.sim
           for index, seat in seats:
             let decision = decisions[index]
@@ -482,6 +537,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                   decision.hypothesis, decision.notes, wasScripted)
             except CatchableError as error:
               decisions[index].failed = true
+              decisions[index].failureKind = fkPlayer
               decisions[index].failureReason = error.msg
               for evidence in decisions[index].attempts.mitems:
                 if evidence.accepted:
@@ -489,16 +545,17 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                   evidence.rejectionReason = some(error.msg)
               decisions[index].selectedAttemptId = none(string)
               failedSeat = seat
+              failedKind = fkPlayer
               failedReason = error.msg
               break
 
         if failedSeat >= 0:
-          batchForfeited = true
+          batchFailed = true
           state.failureSeat = failedSeat
+          state.failureKind = failedKind
           state.failureReason = failedReason
-          echo "eleusis: seat ", failedSeat, " forfeited (", failedReason,
-            "); ending episode"
-          state.sim.endEarly("forfeit")
+          echo "eleusis: seat ", failedSeat, " failed (", failedKind, ": ",
+            failedReason, "); aborting episode unscored"
           if not state.trajectory.isNil:
             for index, seat in seats:
               var observation = decisionView(simCopy, seat, true)
@@ -513,7 +570,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                   hadReply = true
                 if not decisions[index].failed and evidence.accepted:
                   evidence.accepted = false
-                  evidence.rejectionReason = some("turn aborted by seat " & $failedSeat & " forfeit")
+                  evidence.rejectionReason = some("turn aborted by seat " & $failedSeat & " " & $failedKind & " failure")
               for evidence in attempts:
                 if evidence.prompt.kind == JArray and evidence.prompt.len == 2:
                   observation["prompt_attempts"].add(%*{"attempt_id": evidence.attemptId,
@@ -525,7 +582,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               state.trajectory.recordDecision($decisionId & "-" & $seat, $seat,
                 observation, attempts, none(string),
                 newJNull(), status, terminal = true, fallbackOrigin = none(string))
-          state.broadcastLocked()
         else:
           for index, seat in seats:
             let decision = decisions[index]
@@ -587,7 +643,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 executed, status, terminal = state.sim.done, fallbackOrigin = fallback)
           state.broadcastLocked()
 
-      if batchForfeited:
+      if batchFailed:
         break
 
       ## Floor the wall-clock gap between the STARTS of consecutive batches:
@@ -600,7 +656,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if config.turnDelayMs > 0:
         sleep(config.turnDelayMs)
 
-    finishEpisode(runtimeConfig)
+    if state.failureKind != fkNone:
+      abortEpisode(runtimeConfig)
+    else:
+      finishEpisode(runtimeConfig)
 
 var gameThread: Thread[RuntimeConfig]
 
@@ -856,6 +915,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.pendingErrors = newSeq[string](config.players.len)
   state.pendingRejectedActions = newSeq[JsonNode](config.players.len)
   state.failureSeat = -1
+  state.failureKind = fkNone
   state.failureReason = ""
   runtimeConfigGlobal = runtimeConfig
   if getEnv(CogameSaveTrajectoryUriEnv).len > 0:

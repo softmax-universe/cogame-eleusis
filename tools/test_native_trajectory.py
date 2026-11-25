@@ -18,7 +18,10 @@ OUTPUT.mkdir(parents=True, exist_ok=False, mode=0o700)
 for mode in (
     "accepted",
     "invalid",
+    "double-object",
+    "provider-429",
     "provider-error",
+    "missing-credentials",
     "normalized",
     "applied-text",
     "scripted",
@@ -49,28 +52,31 @@ for mode in (
                     action["answers"] = ["PASS"] * 6
             if mode == "applied-text" and seat == 0:
                 action["hypothesis"] = "fixture\rprivate"
-            text = (
-                "not JSON"
-                if mode == "invalid" and seat == 0
-                else (
-                    "```json\n" + json.dumps(action) + "\n```"
-                    if mode == "accepted" and seat == 0
-                    else json.dumps(action)
-                )
-            )
+            if mode == "invalid" and seat == 0:
+                text = "not JSON"
+            elif mode == "double-object" and seat == 0:
+                text = json.dumps(action) + " " + json.dumps(action)
+            elif mode == "accepted" and seat == 0:
+                text = "```json\n" + json.dumps(action) + "\n```"
+            else:
+                text = json.dumps(action)
             body = {
                 "model": "fixture/served",
                 "content": [{"type": "text", "text": text}],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 10, "output_tokens": 5},
             }
-            failure = mode == "provider-error" and seat == 0
-            if failure:
+            status_code = 200
+            if mode == "provider-error" and seat == 0:
+                status_code = 500
                 body = {"error": {"message": "fixture provider error"}}
+            elif mode == "provider-429" and seat == 0:
+                status_code = 429
+                body = {"error": {"message": "fixture rate limited"}}
             call_id = str(uuid.uuid4())
             raw = json.dumps(body)
             calls[call_id] = (request, raw)
-            self.send_response(500 if failure else 200)
+            self.send_response(status_code)
             self.send_header("content-type", "application/json")
             self.send_header("x-softmax-llm-call-id", call_id)
             self.send_header("content-length", str(len(raw.encode())))
@@ -95,13 +101,14 @@ for mode in (
         "rounds": 24,
         "testEvery": 6,
         "testStrips": 6,
-        "hostedModel": "fixture/pinned",
         "promptVariant": "mixed",
         "promptSeed": 4,
         "minBatchSpacingMs": 0,
         "player_connect_timeout_seconds": 5,
         "llmTimeoutSeconds": 5,
     }
+    if mode != "missing-credentials":
+        config["hostedModel"] = "fixture/pinned"
     (output / "config.json").write_text(json.dumps(config))
     env = {
         **os.environ,
@@ -112,16 +119,31 @@ for mode in (
         "COGAME_SAVE_REPLAY_URI": (output / "replay.json").as_uri(),
         "COGAME_SAVE_TRAJECTORY_URI": (output / "trajectory.jsonl").as_uri(),
         "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri(),
+        "COGAME_LOG_URI": (output / "diagnostic.log").as_uri(),
         "COWORLD_EPISODE_ID": str(uuid.uuid4()),
         "COWORLD_GAME_VERSION": "native-fixture",
         "COWORLD_SOURCE_REVISION": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
-        "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{provider.server_port}",
-        "COWORLD_LLM_MODEL": "fixture/requested",
         "PLAYER_PROMPT": "fixture strategy",
         "PLAYER_SCRIPTED": "openbook" if mode == "scripted" else "",
     }
+    if mode == "missing-credentials":
+        for key in (
+            "COWORLD_LLM_ENDPOINT",
+            "COWORLD_LLM_MODEL",
+            "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY_URI",
+        ):
+            env.pop(key, None)
+    else:
+        env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{provider.server_port}"
+        env["COWORLD_LLM_MODEL"] = "fixture/requested"
+    failed_modes = {"invalid", "double-object", "provider-429", "provider-error", "missing-credentials"}
+    player_fail_modes = {"invalid", "double-object"}
+    infra_fail_modes = {"provider-429", "provider-error", "missing-credentials"}
     processes = []
     try:
         with (output / "game.log").open("w") as log:
@@ -146,26 +168,56 @@ for mode in (
                         [PLAYER], cwd=ROOT, env=player_env, stdout=log, stderr=log
                     )
                 )
-            for process in processes:
+            game_rc = processes[0].wait(timeout=90)
+            if mode in failed_modes:
+                assert game_rc != 0, f"{mode}: expected non-zero game exit, got 0"
+            else:
+                assert game_rc == 0, (output / "game.log").read_text()
+            for process in processes[1:]:
                 assert process.wait(timeout=90) == 0, (output / "game.log").read_text()
         events = [
             json.loads(line)
             for line in (output / "trajectory.jsonl").read_text().splitlines()
         ]
-        replay_data = json.loads((output / "replay.json").read_text())
-        expected_family = f"eleusis-rule-{replay_data['config']['ruleId']}"
-        assert events[-1]["seed_family"] == expected_family
+        results_path = output / "results.json"
+        replay_path = output / "replay.json"
         failure_path = output / "player_failure.json"
-        if mode in {"invalid", "provider-error"}:
+        diag_path = output / "diagnostic.log"
+        if mode in failed_modes:
+            assert not results_path.exists(), f"{mode}: results.json must not be written on failure"
+            assert not replay_path.exists(), f"{mode}: replay.json must not be written on failure"
+            assert diag_path.exists(), f"{mode}: diagnostic log missing"
+            diag = json.loads(diag_path.read_text())
+            assert diag["status"] == "failed"
+            assert "scores" not in diag
             assert len(events) == 6 and events[-1]["status"] == "failed"
-            assert events[-1]["outcome"]["reason"] == "forfeit"
+            assert events[-1]["participant_outcomes"] == {}
+            assert "scores" not in events[-1]["outcome"]
             assert events[-1]["outcome"]["rounds"] == 0
-            assert failure_path.exists()
-            failure_info = json.loads(failure_path.read_text())
-            assert failure_info["seat"] == 0 and failure_info["player"] == "p0"
-            assert failure_info["reason"]
+            if mode in player_fail_modes:
+                assert events[-1]["outcome"]["failureKind"] == "player"
+                assert failure_path.exists(), f"{mode}: COGAME_PLAYER_FAILURE_URI must be written for player failure"
+                failure_info = json.loads(failure_path.read_text())
+                assert failure_info["seat"] == 0 and failure_info["player"] == "p0"
+                assert failure_info["reason"]
+            else:
+                assert events[-1]["outcome"]["failureKind"] == "infra"
+                assert not failure_path.exists(), f"{mode}: COGAME_PLAYER_FAILURE_URI must NOT be written for infra failure"
+                if mode == "provider-429":
+                    assert "429" in diag["reason"]
+                elif mode == "provider-error":
+                    assert "500" in diag["reason"]
+                elif mode == "missing-credentials":
+                    assert "credentials" in diag["reason"]
         else:
             assert not failure_path.exists()
+            assert results_path.exists() and replay_path.exists()
+            results_data = json.loads(results_path.read_text())
+            assert results_data["reason"] == "complete"
+            assert len(results_data["scores"]) == 5
+            replay_data = json.loads(replay_path.read_text())
+            expected_family = f"eleusis-rule-{replay_data['config']['ruleId']}"
+            assert events[-1]["seed_family"] == expected_family
             assert len(events) == 141 and events[-1]["status"] == "completed"
             assert (
                 events[-1]["outcome"]["rounds"] == 24
@@ -181,14 +233,13 @@ for mode in (
         joined = set()
         normalized_proposals = 0
         applied_text_changes = 0
-        native_actions = [
-            event
-            for event in replay_data["events"]
-            if event["kind"] in {"skip", "experiment", "answer"}
-        ]
-        if mode in {"invalid", "provider-error"}:
-            assert len(native_actions) == 0
-        else:
+        if mode not in failed_modes:
+            replay_data = json.loads(replay_path.read_text())
+            native_actions = [
+                event
+                for event in replay_data["events"]
+                if event["kind"] in {"skip", "experiment", "answer"}
+            ]
             assert len(native_actions) == len(events) - 1
             for event, native_action in zip(events[:-1], native_actions, strict=True):
                 action = event["executed_action"]
@@ -258,7 +309,7 @@ for mode in (
                         assert mode == "normalized" and event["seat"] == "0"
                 else:
                     assert attempt["rejection_reason"]
-            if mode == "invalid":
+            if mode in player_fail_modes:
                 assert event["selected_attempt_id"] is None
                 assert event["executed_action"] is None
                 assert event["fallback_origin"] is None
@@ -267,12 +318,12 @@ for mode in (
                     assert len(event["attempts"]) == 2
                 else:
                     assert event["action_status"] == "missing"
-            elif mode == "provider-error":
+            elif mode in infra_fail_modes:
                 assert event["selected_attempt_id"] is None
                 assert event["executed_action"] is None
                 assert event["fallback_origin"] is None
                 assert event["action_status"] == "missing"
-                if event["seat"] == "0":
+                if mode != "missing-credentials" and event["seat"] == "0":
                     assert len(event["attempts"]) == 2
             elif mode == "applied-text" and event["seat"] == "0":
                 assert event["action_status"] == "rejected"
@@ -281,14 +332,14 @@ for mode in (
             else:
                 assert event["action_status"] == "accepted"
         assert joined == set(calls)
-        replay = (output / "replay.json").read_text()
-        assert "platform_call_id" not in replay and "prompt_attempts" not in replay
+        if mode not in failed_modes:
+            replay = replay_path.read_text()
+            assert "platform_call_id" not in replay and "prompt_attempts" not in replay
         assert normalized_proposals == (28 if mode == "normalized" else 0)
         assert applied_text_changes == (28 if mode == "applied-text" else 0)
         proof = {
             "mode": mode,
             "requested_seed": config["seed"],
-            "hidden_rule_id": replay_data["config"]["ruleId"],
             "scenario_family": events[-1]["seed_family"],
             "decisions": len(events) - 1,
             "provider_calls": len(joined),
@@ -308,10 +359,11 @@ for mode in (
         (output / "proof.json").write_text(json.dumps(proof, indent=2) + "\n")
         print(
             mode,
-            "140 decisions",
+            len(events) - 1,
+            "decisions",
             len(joined),
             "exact provider joins",
-            expected_family,
+            events[-1]["seed_family"],
             flush=True,
         )
     finally:

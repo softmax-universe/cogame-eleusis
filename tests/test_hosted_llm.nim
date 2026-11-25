@@ -16,3 +16,37 @@ block:
     doAssert not body.hasKey("anthropic_version")
     doAssert not body.hasKey("output_config")
   echo "hosted sidecar routing and seat attribution passed"
+
+block:
+  delEnv("COWORLD_LLM_ENDPOINT")
+  delEnv("COWORLD_LLM_MODEL")
+  delEnv("BEDROCK_MODEL")
+  putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9200/")
+  putEnv("AWS_BEARER_TOKEN_BEDROCK", "test-bedrock-token")
+  let client = newLlmClient(GameConfig())
+  doAssert client.transport == ltBedrock
+  doAssert client.bedrockModel == DefaultBedrockModel
+  let expectedUrl = "http://127.0.0.1:9200/model/" & DefaultBedrockModel & "/invoke"
+  doAssert client.bedrockUrl() == expectedUrl
+
+  var raised429 = false
+  try:
+    discard client.textOf(Response(code: 429, body: "throttled"), "", expectedUrl)
+  except LlmInfraError:
+    raised429 = true
+  doAssert raised429
+  doAssert not client.disabled
+  doAssert client.bedrockModel == DefaultBedrockModel
+  doAssert client.bedrockUrl() == expectedUrl
+
+  var raised403 = false
+  try:
+    discard client.textOf(
+      Response(code: 403, body: "Model access is denied"), "", expectedUrl)
+  except LlmInfraError:
+    raised403 = true
+  doAssert raised403
+  doAssert client.disabled
+  doAssert client.bedrockModel == DefaultBedrockModel
+  doAssert client.bedrockUrl() == expectedUrl
+  echo "bedrock single-model no-fallback checks passed"

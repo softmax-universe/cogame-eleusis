@@ -47,16 +47,17 @@ The game validates and applies all five simultaneous decisions. Prompt policies
 still use the game's Claude adapter. Three built-in **scripted baselines** share one
 version-space engine: `openbook` publishes every result, `hoarder` publishes
 none, and `freerider` runs no experiments. They
-play any seat that registers as scripted, and every seat when no LLM
-credentials are available, so episodes (and offline certification) always
-complete.
+play any seat that registers explicitly as scripted (`PLAYER_SCRIPTED`),
+including purely scripted offline certification.
 
 The `freerider` baseline runs no experiments and predicts from the shared
 corkboard. It is a control for short episodes that reward avoiding experiment
 costs. External players receive private facts and the public catalogue, then
 return complete research or prediction actions. The game validates every model
-and external reply strictly and forfeits the episode on rejected or missing
-player replies rather than silently substituting a scripted move.
+and external reply strictly and aborts an unfinished episode unscored with
+attributable failure diagnostics on rejected, missing, or provider/infrastructure
+failures rather than silently substituting a scripted move or inventing a forfeit
+score.
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy
 display names never reach the agents' prompts, so nobody can meta-game "that
@@ -64,10 +65,10 @@ seat is the champion". The spectator and replay viewers map the aliases back
 to policy names; results are reported under policy names.
 
 The episode ends `complete` after the test that follows the final research
-round (default 24 rounds, 4..60), `deadline` when the episode clock stops
-play between batches, or `forfeit` when a player fails to supply a valid
-action — an unfinished test is discarded unscored and the tests already
-settled keep their money.
+round (default 24 rounds, 4..60), or `deadline` when the episode clock stops
+play between batches — an unfinished test is discarded unscored and the tests
+already settled keep their money. Unfinished episodes that hit a player or
+infrastructure failure terminate unscored without writing `results.json`.
 
 ## Layout
 
