@@ -133,15 +133,12 @@ suite "catalogue and machine":
       rules.incl(pickRule(seed).id)
     check rules.len > 1
 
-  test "normaliseStrip is tolerant on shape, strict on legality":
-    check normaliseStrip("rb gy") == "RBGY"
-    check normaliseStrip("R-B_G,Y") == "RBGY"
+  test "normaliseStrip accepts only empty skip or exact 4-letter RBGY strips":
+    check normaliseStrip("RBGY") == "RBGY"
     check normaliseStrip("") == ""
-    check normaliseStrip("   ") == ""
-    expect EleusisError:
-      discard normaliseStrip("RBG")
-    expect EleusisError:
-      discard normaliseStrip("RBGZ")
+    for bad in ["rb gy", "R-B_G,Y", "rbgy", "   ", "RBGYR", "RBG", "RBGZ"]:
+      expect EleusisError:
+        discard normaliseStrip(bad)
 
 suite "turn resolution":
   test "an experiment charges once, records the verdict, and is used up":
@@ -546,6 +543,15 @@ suite "replay":
     check shortFrames[^1].roundsPlayed == 1
     ## Including the results the seats were still holding when it stopped.
     check $shortFrames[^1].benchStateJson() == $short.benchStateJson()
+    ## A recorded forfeit stop is honoured identically.
+    var forfeited = initSim(config)
+    forfeited.researchAll(offset = 3)
+    forfeited.endEarly("forfeit")
+    let forfeitFrames = replayMatch(config, forfeited.events)
+    check forfeitFrames[^1].done
+    check forfeitFrames[^1].reason == "forfeit"
+    check forfeitFrames[^1].roundsPlayed == 1
+    check $forfeitFrames[^1].benchStateJson() == $forfeited.benchStateJson()
 
   test "a tampered test event is rejected":
     let config = fixtureConfig(rounds = 4, seed = 11, testEvery = 4)

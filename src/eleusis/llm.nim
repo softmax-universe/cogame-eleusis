@@ -7,7 +7,8 @@
 ## Every seat decides SIMULTANEOUSLY by rule, so all five requests go out as
 ## ONE parallel batch per turn (curly.makeRequests); invalid replies are
 ## retried once as a smaller batch with a hint, and anything still failing
-## falls back to the `openbook` scripted baseline.
+## is surfaced as a seat failure/forfeit rather than silently replaced with a
+## scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -47,9 +48,8 @@ type
     answers*: seq[Verdict]  ## test turns only
     hypothesis*: string
     notes*: string          ## "" when the reply carried none
-    fallback*: bool         ## true when the scripted baseline stood in for an
-                            ## LLM reply that never arrived, so the server can
-                            ## record it on the event and phase 60 can count it
+    failed*: bool           ## true when the seat failed to produce a valid decision
+    failureReason*: string  ## diagnostic reason when failed == true
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -70,14 +70,14 @@ type
     disabled*: bool   ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"openbook" play the publish-
-  ## everything baseline, "hoarder" the publish-nothing one, anything else
-  ## nothing (the seat is LLM-driven).
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "openbook", "open-book", "open": skOpenbook
-  of "hoarder", "hoard", "secretive": skHoarder
-  of "freerider", "free-rider", "free": skFreerider
-  else: skNone
+  ## PLAYER_SCRIPTED values: "openbook", "hoarder", "freerider", or "" (LLM-driven).
+  case text.strip()
+  of "": skNone
+  of "openbook": skOpenbook
+  of "hoarder": skHoarder
+  of "freerider": skFreerider
+  else:
+    raise newException(EleusisError, "unknown scripted policy: " & text)
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -269,8 +269,7 @@ Your notes are private and are handed back to you every turn. Your
 hypothesis line is PUBLIC - every rival reads it, and it is not binding.
 
 OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis,
-no explanation, no markdown fences, no text before or after the object. Your
-reply must begin with the character { and end with }."""
+no explanation, and no surrounding text."""
 
 proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   ## The seat's rules-of-the-world block. The whole hypothesis space is
@@ -416,19 +415,49 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
+proc replyHead(text: string): string =
+  result = text.strip()
+  if result.len > 160:
+    result = result[0 ..< 160] & "..."
+  result = result.replace("\n", " ")
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model sent
-    ## instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(EleusisError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  ## Parses exactly one JSON object: either bare or inside a single ordinary
+  ## outer Markdown code fence (plain or json-tagged). Rejects surrounding
+  ## prose, extra objects, unsupported fence tags, and non-object JSON.
+  let trimmed = text.strip()
+  if trimmed.len == 0:
+    raise newException(EleusisError, "no JSON object in response")
+  var body = trimmed
+  if trimmed.startsWith("```"):
+    let nl = trimmed.find('\n')
+    if nl < 0:
+      raise newException(EleusisError,
+        "unclosed markdown code fence in response: " & replyHead(text))
+    let openLine = trimmed[0 ..< nl].strip(leading = false, trailing = true)
+    if openLine.toLowerAscii() notin ["```", "```json"]:
+      raise newException(EleusisError,
+        "unsupported markdown code fence in response: " & openLine)
+    let rest = trimmed[nl + 1 .. ^1]
+    if not rest.endsWith("```"):
+      raise newException(EleusisError,
+        "unclosed markdown code fence in response: " & replyHead(text))
+    let beforeClose = rest[0 ..< rest.len - 3].strip(
+      leading = false, trailing = true, chars = {' ', '\t'})
+    if beforeClose.len > 0 and beforeClose[^1] notin {'\n', '\r'}:
+      raise newException(EleusisError,
+        "closing markdown fence must be on its own line: " & replyHead(text))
+    body = beforeClose.strip()
+  if not (body.startsWith("{") and body.endsWith("}")):
+    raise newException(EleusisError,
+      "response must be a single JSON object: " & replyHead(text))
+  try:
+    result = parseJson(body)
+  except CatchableError as error:
+    raise newException(EleusisError,
+      "invalid JSON object in response: " & error.msg)
+  if result.isNil or result.kind != JObject:
+    raise newException(EleusisError, "the reply is not a JSON object")
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -504,29 +533,14 @@ proc cleanText*(text: string, limit: int): string =
     return
   result = result.runeSubStr(0, limit - 1) & "…"
 
-proc parseBoolish(node: JsonNode): bool =
-  if node.isNil:
-    return false
-  case node.kind
-  of JBool: node.getBool()
-  of JInt: node.getInt() != 0
-  of JFloat: node.getFloat() != 0.0
-  of JString:
-    case node.getStr().strip().toLowerAscii()
-    of "true", "yes", "y", "1", "publish": true
-    else: false
-  else: false
-
 proc parseAnswer(node: JsonNode): Verdict =
-  if node.kind == JBool:
-    return (if node.getBool(): vPass else: vFail)
   if node.kind != JString:
     raise newException(EleusisError,
       "an answer must be PASS or FAIL, got " & $node)
-  case node.getStr().strip().toLowerAscii()
-  of "pass", "p", "true", "yes":
+  case node.getStr()
+  of "PASS", "pass":
     result = vPass
-  of "fail", "f", "false", "no":
+  of "FAIL", "fail":
     result = vFail
   else:
     raise newException(EleusisError,
@@ -534,13 +548,31 @@ proc parseAnswer(node: JsonNode): Verdict =
 
 proc parseDecision*(payload: JsonNode, testStrips: int, testing: bool):
     Decision =
-  ## Tolerant on shape, strict on legality.
+  ## Strict on schema and legality; preserves genuine optional fields.
   if payload.isNil or payload.kind != JObject:
     raise newException(EleusisError, "the reply is not a JSON object")
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.hypothesis = cleanText(payload{"hypothesis"}.getStr(),
-    MaxHypothesisLen).replace("\n", " ")
-  result.publish = parseBoolish(payload{"publish"})
+  for key, _ in payload:
+    let allowed =
+      if testing: key in ["answers", "publish", "hypothesis", "notes"]
+      else: key in ["experiment", "publish", "hypothesis", "notes"]
+    if not allowed:
+      raise newException(EleusisError, "unexpected field in decision: " & key)
+  if payload.hasKey("notes"):
+    let notesNode = payload["notes"]
+    if notesNode.kind != JString:
+      raise newException(EleusisError, "notes must be a string")
+    result.notes = cleanText(notesNode.getStr(), MaxNotesLen)
+  if payload.hasKey("hypothesis"):
+    let hypNode = payload["hypothesis"]
+    if hypNode.kind != JString:
+      raise newException(EleusisError, "hypothesis must be a string")
+    result.hypothesis = cleanText(hypNode.getStr(),
+      MaxHypothesisLen).replace("\n", " ")
+  if payload.hasKey("publish"):
+    let pubNode = payload["publish"]
+    if pubNode.kind != JBool:
+      raise newException(EleusisError, "publish must be a boolean")
+    result.publish = pubNode.getBool()
   if testing:
     let node = payload{"answers"}
     if node.isNil or node.kind != JArray:
@@ -570,12 +602,8 @@ proc decisionJson*(decision: Decision, testing: bool): JsonNode =
 proc playsScripted*(client: LlmClient, prompt: string,
     kind: ScriptKind): bool =
   ## A seat plays a built-in baseline instead of Claude when it registered as
-  ## scripted, when there are no credentials at all, or when it has never
-  ## delivered a prompt — the reference player always sends one (its own
-  ## default strategy when `PLAYER_PROMPT` is empty), so an empty prompt means
-  ## the pod never connected inside `playerConnectTimeoutSeconds`. Such a slot
-  ## plays `openbook` rather than an LLM call with no operator guidance.
-  kind != skNone or client.disabled or prompt.strip().len == 0
+  ## scripted or when there are no LLM credentials at all (offline certification).
+  kind != skNone or client.disabled
 
 proc decideAll*(
   client: LlmClient,
@@ -586,9 +614,10 @@ proc decideAll*(
   selection: PromptSelection
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — all of them as ONE parallel
-  ## batch, because every seat decides simultaneously by rule. Never raises:
-  ## any failure falls back to the `openbook` scripted baseline so the
-  ## episode always advances. `prompts` and `scripted` are indexed by SEAT.
+  ## batch, because every seat decides simultaneously by rule. Any seat that
+  ## fails to produce a valid decision is marked `failed = true` instead of
+  ## silently substituting a scripted move. `prompts` and `scripted` are indexed
+  ## by SEAT.
   result = newSeq[Decision](seats.len)
   let testing = sim.phase == phTest
   var open: seq[int]     ## indexes into `seats` still undecided
@@ -597,6 +626,9 @@ proc decideAll*(
     if client.playsScripted(prompts[seat], kind):
       result[index] = scriptedAction(sim, seat,
         (if kind == skNone: skOpenbook else: kind))
+    elif prompts[seat].strip().len == 0:
+      result[index].failed = true
+      result[index].failureReason = "no prompt delivered for seat"
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -670,10 +702,9 @@ proc decideAll*(
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "eleusis llm: seat ", seat, " falling back to scripted decision"
-    let attempts = result[index].attempts
-    result[index] = scriptedAction(sim, seat, skOpenbook)
-    result[index].attempts = attempts
-    ## Recorded on the decision event too, not only on stdout: the replay is
-    ## what phase 60 counts fallbacks from.
-    result[index].fallback = true
+    var reason = "no valid model reply"
+    if result[index].attempts.len > 0 and result[index].attempts[^1].rejectionReason.isSome:
+      reason = result[index].attempts[^1].rejectionReason.get()
+    echo "eleusis llm: seat ", seat, " failed to produce a valid decision: ", reason
+    result[index].failed = true
+    result[index].failureReason = reason

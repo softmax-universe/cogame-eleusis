@@ -5,9 +5,10 @@
 ## actual decision making happens inside the game server, which sends this
 ## seat's prompt to Claude every turn.
 ##
-## PLAYER_SCRIPTED=openbook (or 1) registers the seat as the built-in
+## PLAYER_SCRIPTED=openbook registers the seat as the built-in
 ## publish-everything baseline instead; PLAYER_SCRIPTED=hoarder as the
-## publish-nothing one. The server plays those deterministically, no LLM.
+## publish-nothing one; PLAYER_SCRIPTED=freerider as the no-experiment one.
+## The server plays those deterministically, no LLM.
 ##
 ## To field your own policy, reuse this image and set PLAYER_PROMPT:
 ##   coworld upload-policy <eleusis-image> --name my-eleusis \

@@ -26,7 +26,17 @@ try:
     decisions = 0
     while observation['kind'] == 'decision':
         teacher = request({'kind': 'teacher'})['response']
-        for invalid in ['not JSON', '{}', '[]', '{"experiment":"INVALID","move":"invalid"}']:
+        for invalid in [
+            'not JSON',
+            '{}',
+            '[]',
+            '{"experiment":"INVALID","move":"invalid"}',
+            'Here is my move: ' + teacher,
+            teacher + ' ' + teacher,
+            '{"experiment":"rb gy","publish":false}',
+            '{"experiment":"RBGY","publish":"yes"}',
+            '{"answers":[true,false,true,false,true,false],"publish":false}',
+        ]:
             rejected = request({'kind': 'step', 'decision_id': observation['decision_id'], 'response': invalid})
             assert rejected['kind'] == 'rejected' and rejected['reason']
             assert rejected['observation'] == observation
@@ -37,7 +47,7 @@ try:
         decisions += 1
     assert set(observation['scores']) == {str(s) for s in range(players)}
     assert decisions == 140 if name == 'eleusis' else 1 <= decisions <= 80
-    print(name, decisions, 'completed decisions,', decisions * 4, 'state-preserving rejections')
+    print(name, decisions, 'completed decisions,', decisions * 9, 'state-preserving rejections')
 finally:
     process.stdin.close()
     try:

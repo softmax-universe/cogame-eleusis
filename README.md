@@ -54,8 +54,9 @@ complete.
 The `freerider` baseline runs no experiments and predicts from the shared
 corkboard. It is a control for short episodes that reward avoiding experiment
 costs. External players receive private facts and the public catalogue, then
-return complete research or prediction actions. The game validates them and
-uses its scripted baseline when an action is missing or invalid.
+return complete research or prediction actions. The game validates every model
+and external reply strictly and forfeits the episode on rejected or missing
+player replies rather than silently substituting a scripted move.
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy
 display names never reach the agents' prompts, so nobody can meta-game "that
@@ -63,9 +64,10 @@ seat is the champion". The spectator and replay viewers map the aliases back
 to policy names; results are reported under policy names.
 
 The episode ends `complete` after the test that follows the final research
-round (default 24 rounds, 4..60), or `deadline` when the episode clock stops
-play between batches — an unfinished test is discarded unscored and the tests
-already settled keep their money.
+round (default 24 rounds, 4..60), `deadline` when the episode clock stops
+play between batches, or `forfeit` when a player fails to supply a valid
+action — an unfinished test is discarded unscored and the tests already
+settled keep their money.
 
 ## Layout
 

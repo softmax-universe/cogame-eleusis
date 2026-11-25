@@ -150,11 +150,7 @@ suite "scripted baselines":
         decisions[index].hypothesis, decisions[index].notes, true)
     check sim.round == 2
 
-  test "a slot that never delivered a prompt plays openbook, not an LLM call":
-    ## The reference player always delivers a prompt (its own default strategy
-    ## when PLAYER_PROMPT is empty), so an empty prompt means the pod never
-    ## connected. That seat plays the scripted baseline for the episode
-    ## instead of calling Claude with an empty operator block.
+  test "a slot that never delivered a prompt fails instead of silently playing openbook":
     putEnv("ANTHROPIC_API_KEY", "not-a-real-key")
     let config = fixture(17, rounds = 8, testEvery = 4)
     let client = newLlmClient(config)
@@ -165,49 +161,61 @@ suite "scripted baselines":
       @["", "  ", "", "", ""], @[skNone, skNone, skNone, skNone, skNone], PromptSelection())
     check decisions.len == Seats
     for index, seat in seats:
-      ## No request was ever built, so nothing failed and nothing fell back.
-      check not decisions[index].fallback
-      check decisions[index] == scriptedAction(sim, seat, skOpenbook)
+      check decisions[index].failed
+      check decisions[index].failureReason.len > 0
+      check decisions[index].attempts.len == 0
     delEnv("ANTHROPIC_API_KEY")
 
-  test "model replies parse, and illegal ones are rejected":
-    check parseDecision(parseJson("""{"experiment": "rb gy"}"""), 6,
-      false).strip == "RBGY"
-    check parseDecision(parseJson("""{"experiment": "R-B-G-Y"}"""), 6,
+  test "model replies parse strictly, and legacy shims or prose are rejected":
+    check parseDecision(parseJson("""{"experiment": "RBGY"}"""), 6,
       false).strip == "RBGY"
     check parseDecision(parseJson("""{"experiment": ""}"""), 6,
       false).strip == ""
     let full = parseDecision(parseJson(
-      """{"experiment": "RRBG", "publish": "yes", "hypothesis": "ADJACENT R B?",
+      """{"experiment": "RRBG", "publish": true, "hypothesis": "ADJACENT R B?",
           "notes": "shortlist: 3"}"""), 6, false)
     check full.strip == "RRBG"
     check full.publish
     check full.hypothesis == "ADJACENT R B?"
     check full.notes == "shortlist: 3"
+    ## Optional fields default cleanly when omitted.
     check not parseDecision(parseJson("""{"experiment": "RRBG"}"""), 6,
       false).publish
-    expect EleusisError:
-      discard parseDecision(parseJson("""{"experiment": "RBG"}"""), 6, false)
-    expect EleusisError:
-      discard parseDecision(parseJson("""{"experiment": "RBGZ"}"""), 6, false)
-    expect EleusisError:
-      discard parseDecision(parseJson("""{"notes": "no experiment"}"""), 6,
-        false)
-    expect EleusisError:
-      discard parseDecision(parseJson("""[1, 2]"""), 6, false)
-    ## Test turns: exactly testStrips entries, PASS/FAIL either case.
+    ## Legacy shims, aliases, wrong types, and unknown fields are rejected.
+    for badResearch in [
+      """{"experiment": "rb gy"}""",
+      """{"experiment": "R-B-G-Y"}""",
+      """{"experiment": "rbgy"}""",
+      """{"experiment": "RBGYR"}""",
+      """{"experiment": "RBG"}""",
+      """{"experiment": "RBGZ"}""",
+      """{"experiment": "RRBG", "publish": "yes"}""",
+      """{"experiment": "RRBG", "publish": "true"}""",
+      """{"experiment": "RRBG", "publish": 1}""",
+      """{"experiment": "RRBG", "notes": 123}""",
+      """{"experiment": "RRBG", "hypothesis": true}""",
+      """{"experiment": "RRBG", "extra": "nope"}""",
+      """{"experiment": "RRBG", "answers": ["PASS","FAIL","PASS","FAIL","PASS","FAIL"]}""",
+      """{"notes": "no experiment"}""",
+      """[1, 2]"""
+    ]:
+      expect EleusisError:
+        discard parseDecision(parseJson(badResearch), 6, false)
+    ## Test turns: exactly testStrips entries of PASS/FAIL (or canonical pass/fail).
     let answered = parseDecision(parseJson(
-      """{"answers": ["PASS", "fail", "P", "F", true, false]}"""), 6, true)
+      """{"answers": ["PASS", "fail", "pass", "FAIL", "PASS", "FAIL"], "publish": false}"""), 6, true)
     check answered.answers == @[vPass, vFail, vPass, vFail, vPass, vFail]
-    expect EleusisError:
-      discard parseDecision(parseJson(
-        """{"answers": ["PASS", "FAIL", "PASS", "FAIL", "PASS"]}"""), 6, true)
-    expect EleusisError:
-      discard parseDecision(parseJson(
-        """{"answers": ["PASS", "FAIL", "PASS", "FAIL", "PASS", "maybe"]}"""),
-        6, true)
-    expect EleusisError:
-      discard parseDecision(parseJson("""{"experiment": "RBGY"}"""), 6, true)
+    for badTest in [
+      """{"answers": ["PASS", "FAIL", "PASS", "FAIL", "PASS"]}""",
+      """{"answers": ["PASS", "FAIL", "PASS", "FAIL", "PASS", "maybe"]}""",
+      """{"answers": ["P", "F", "PASS", "FAIL", "PASS", "FAIL"]}""",
+      """{"answers": [true, false, true, false, true, false]}""",
+      """{"answers": ["yes", "no", "PASS", "FAIL", "PASS", "FAIL"]}""",
+      """{"experiment": "RBGY"}""",
+      """{"answers": ["PASS","FAIL","PASS","FAIL","PASS","FAIL"], "experiment": ""}"""
+    ]:
+      expect EleusisError:
+        discard parseDecision(parseJson(badTest), 6, true)
     ## Rune-safe truncation of everything that lands in the replay.
     var long = ""
     for index in 0 ..< 900:
@@ -215,13 +223,32 @@ suite "scripted baselines":
     check cleanText(long, MaxNotesLen).runeLen == MaxNotesLen
     check cleanText(long, MaxHypothesisLen).runeLen == MaxHypothesisLen
     check cleanText(long, MaxNotesLen).validateUtf8() == -1
-    check parseScriptKind("1") == skOpenbook
+    ## Strict scripted policy names (no legacy aliases).
     check parseScriptKind("openbook") == skOpenbook
     check parseScriptKind("hoarder") == skHoarder
     check parseScriptKind("freerider") == skFreerider
     check parseScriptKind("") == skNone
-    let extracted = extractJsonObject("prose {\"experiment\": \"RBGY\"} tail")
-    check extracted{"experiment"}.getStr() == "RBGY"
+    for badScript in ["1", "true", "yes", "open-book", "open", "secretive", "free-rider", "typo"]:
+      expect EleusisError:
+        discard parseScriptKind(badScript)
+    ## JSON extraction: bare object or single ordinary outer markdown code fence only.
+    check extractJsonObject("""{"experiment": "RBGY"}"""){"experiment"}.getStr() == "RBGY"
+    check extractJsonObject("```\n{\"experiment\": \"RBGY\"}\n```"){"experiment"}.getStr() == "RBGY"
+    check extractJsonObject("```json\n{\"experiment\": \"RBGY\"}\n```"){"experiment"}.getStr() == "RBGY"
+    check extractJsonObject("```JSON\n{\"experiment\": \"RBGY\"}\n```"){"experiment"}.getStr() == "RBGY"
+    for badReply in [
+      "prose {\"experiment\": \"RBGY\"} tail",
+      "Here is my move:\n```json\n{\"experiment\": \"RBGY\"}\n```",
+      "```json\n{\"experiment\": \"RBGY\"}\n```\nDone.",
+      "{\"experiment\": \"RBGY\"} {\"experiment\": \"RRRR\"}",
+      "```json\n{\"experiment\": \"RBGY\"}\n```\n```json\n{\"experiment\": \"RRRR\"}\n```",
+      "```python\n{\"experiment\": \"RBGY\"}\n```",
+      "```json\n{\"experiment\": \"RBGY\"}",
+      "[1, 2]",
+      ""
+    ]:
+      expect EleusisError:
+        discard extractJsonObject(badReply)
 
   test "prompts carry the seat's own view and nothing hidden":
     var sim = initSim(fixture(7, rounds = 8, testEvery = 4))
@@ -244,5 +271,5 @@ suite "scripted baselines":
     check text.runeLen > 200
     let system = sim.systemPrompt(0, PromptSelection())
     check "ELEUSIS laboratory" in system
-    check "must begin with the character {" in system
+    check "reply with ONLY one JSON object" in system
     check sim.ruleText() notin system

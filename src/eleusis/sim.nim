@@ -162,25 +162,17 @@ proc indexOfStrip*(strip: string): int =
     result = result * Colours.len + colour
 
 proc normaliseStrip*(text: string): string =
-  ## "" (skip) for an empty or separator-only input; the 4-letter strip
-  ## otherwise. Raises on anything that is not a legal strip: uppercased and
-  ## stripped of whitespace and separators, the first four characters must
-  ## all be colours.
-  var cleaned = ""
-  for letter in text:
-    if letter in {' ', '\t', '\n', '\r', '-', '_', ','}:
-      continue
-    cleaned.add(toUpperAscii(letter))
-  if cleaned.len == 0:
+  ## "" (skip) or an exact 4-letter strip from RBGY.
+  if text.len == 0:
     return ""
-  if cleaned.len < StripLen:
+  if text.len != StripLen:
     raise newException(EleusisError,
       "a strip is " & $StripLen & " tokens from RBGY: " & text)
-  result = cleaned[0 ..< StripLen]
-  for letter in result:
+  for letter in text:
     if colourIndex(letter) < 0:
       raise newException(EleusisError,
         "a strip is " & $StripLen & " tokens from RBGY: " & text)
+  text
 
 proc countOf(strip: string, colour: int): int =
   for letter in strip:
@@ -824,12 +816,10 @@ proc applyAnswers*(sim: var Sim, seat: int, answers: seq[Verdict],
   sim.discloseNow(seat, publish)
   sim.recordAnswer(seat, answers, scripted, fallback)
 
-proc endEarly*(sim: var Sim) =
-  ## Stop now, between batches. The platform kills an episode that outlives
-  ## its timeout and keeps NOTHING, so a short honest episode always beats a
-  ## long one that never lands. An open test that was never fully answered is
-  ## discarded unscored; tests already settled keep their money; a result a
-  ## seat is still holding stays hoarded.
+proc endEarly*(sim: var Sim, reason = "deadline") =
+  ## Stop now, between batches (on episode deadline or player forfeit). An open
+  ## test that was never fully answered is discarded unscored; tests already
+  ## settled keep their money; a result a seat is still holding stays hoarded.
   if sim.done:
     return
   ## A result a seat is still holding when the clock stops stays HOARDED: it
@@ -855,7 +845,7 @@ proc endEarly*(sim: var Sim) =
     ## stamps and correctness pips on `open`, so without this flag a
     ## discarded test would be revealed as though it had been marked.
     sim.test.discarded = true
-  sim.settle("deadline")
+  sim.settle(reason)
 
 # ---- Results ----------------------------------------------------------------
 
@@ -1124,10 +1114,10 @@ proc eventToJson*(event: GameEvent): JsonNode =
     result["text"] = %event.text
 
 proc parseVerdict(text: string): Verdict =
-  case text.toLowerAscii()
-  of "pass", "p", "true":
+  case text
+  of "pass", "PASS":
     result = vPass
-  of "fail", "f", "false":
+  of "fail", "FAIL":
     result = vFail
   else:
     raise newException(EleusisError, "not a verdict: " & text)
@@ -1248,12 +1238,12 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[Sim] =
         sim.events.add(event)
     of evEnd:
       if not sim.done:
-        ## A deadline stop is not derivable from the decisions alone; a
-        ## recorded "complete" that the rules did not reach is a tamper.
-        if event.text != "deadline":
+        ## A deadline or forfeit stop is not derivable from the decisions alone;
+        ## a recorded "complete" that the rules did not reach is a tamper.
+        if event.text notin ["deadline", "forfeit"]:
           raise newException(EleusisError,
             "the recorded ending does not match the re-derivation")
-        sim.endEarly()
+        sim.endEarly(event.text)
       if sim.reason != event.text:
         raise newException(EleusisError,
           "the recorded ending does not match the re-derivation")
