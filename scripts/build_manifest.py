@@ -241,9 +241,10 @@ PLAYER_PROTOCOL = (
     "the player should exit. player->game frames: "
     '{"type":"prompt","prompt":str,"scripted":str} - the prompt (max '
     "4000 runes) is the policy, sent right after connecting and again after "
-    'welcome; scripted "openbook" (or "1") plays the built-in '
+    'welcome; scripted "openbook" plays the built-in '
     'publish-everything baseline for that seat, "hoarder" the '
-    'publish-nothing one, "" means LLM-driven. The reference player reads '
+    'publish-nothing one, "freerider" the no-experiment one, "" means '
+    'LLM-driven. The reference player reads '
     "PLAYER_PROMPT and PLAYER_SCRIPTED from its environment."
 )
 
@@ -561,11 +562,12 @@ RESULTS_SCHEMA = {
         "reason": {
             "description": (
                 "How the episode ended: complete (the test after the final "
-                "round settled) or deadline (the play clock stopped it "
-                "between batches; settled tests keep their money)."
+                "round settled), deadline (the play clock stopped it "
+                "between batches; settled tests keep their money), or forfeit "
+                "(a player failed to provide a valid action)."
             ),
             "type": "string",
-            "enum": ["complete", "deadline"],
+            "enum": ["complete", "deadline", "forfeit"],
         },
     },
 }

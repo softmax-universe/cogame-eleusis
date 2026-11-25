@@ -49,7 +49,15 @@ for mode in (
                     action["answers"] = ["PASS"] * 6
             if mode == "applied-text" and seat == 0:
                 action["hypothesis"] = "fixture\rprivate"
-            text = "not JSON" if mode == "invalid" and seat == 0 else json.dumps(action)
+            text = (
+                "not JSON"
+                if mode == "invalid" and seat == 0
+                else (
+                    "```json\n" + json.dumps(action) + "\n```"
+                    if mode == "accepted" and seat == 0
+                    else json.dumps(action)
+                )
+            )
             body = {
                 "model": "fixture/served",
                 "content": [{"type": "text", "text": text}],
@@ -103,6 +111,7 @@ for mode in (
         "COGAME_RESULTS_URI": (output / "results.json").as_uri(),
         "COGAME_SAVE_REPLAY_URI": (output / "replay.json").as_uri(),
         "COGAME_SAVE_TRAJECTORY_URI": (output / "trajectory.jsonl").as_uri(),
+        "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri(),
         "COWORLD_EPISODE_ID": str(uuid.uuid4()),
         "COWORLD_GAME_VERSION": "native-fixture",
         "COWORLD_SOURCE_REVISION": subprocess.check_output(
@@ -143,21 +152,32 @@ for mode in (
             json.loads(line)
             for line in (output / "trajectory.jsonl").read_text().splitlines()
         ]
-        assert len(events) == 141 and events[-1]["status"] == "completed"
-        assert (
-            events[-1]["outcome"]["rounds"] == 24
-            and events[-1]["outcome"]["tests"] == 4
-        )
-        for start in range(0, 140, 5):
-            batch = events[start : start + 5]
-            for key in ("board", "seats", "test_strips"):
-                assert all(
-                    event["observation"][key] == batch[0]["observation"][key]
-                    for event in batch
-                )
         replay_data = json.loads((output / "replay.json").read_text())
         expected_family = f"eleusis-rule-{replay_data['config']['ruleId']}"
         assert events[-1]["seed_family"] == expected_family
+        failure_path = output / "player_failure.json"
+        if mode in {"invalid", "provider-error"}:
+            assert len(events) == 6 and events[-1]["status"] == "failed"
+            assert events[-1]["outcome"]["reason"] == "forfeit"
+            assert events[-1]["outcome"]["rounds"] == 0
+            assert failure_path.exists()
+            failure_info = json.loads(failure_path.read_text())
+            assert failure_info["seat"] == 0 and failure_info["player"] == "p0"
+            assert failure_info["reason"]
+        else:
+            assert not failure_path.exists()
+            assert len(events) == 141 and events[-1]["status"] == "completed"
+            assert (
+                events[-1]["outcome"]["rounds"] == 24
+                and events[-1]["outcome"]["tests"] == 4
+            )
+            for start in range(0, 140, 5):
+                batch = events[start : start + 5]
+                for key in ("board", "seats", "test_strips"):
+                    assert all(
+                        event["observation"][key] == batch[0]["observation"][key]
+                        for event in batch
+                    )
         joined = set()
         normalized_proposals = 0
         applied_text_changes = 0
@@ -166,17 +186,20 @@ for mode in (
             for event in replay_data["events"]
             if event["kind"] in {"skip", "experiment", "answer"}
         ]
-        assert len(native_actions) == len(events) - 1
-        for event, native_action in zip(events[:-1], native_actions, strict=True):
-            action = event["executed_action"]
-            if action["hypothesis"]:
-                assert action["hypothesis"] == native_action.get("hypothesis", "")
-            if action["notes"]:
-                assert action["notes"] == native_action.get("text", "")
-            if "answers" in action:
-                assert action["answers"] == native_action["answers"]
-            else:
-                assert action["experiment"] == native_action.get("strip", "")
+        if mode in {"invalid", "provider-error"}:
+            assert len(native_actions) == 0
+        else:
+            assert len(native_actions) == len(events) - 1
+            for event, native_action in zip(events[:-1], native_actions, strict=True):
+                action = event["executed_action"]
+                if action["hypothesis"]:
+                    assert action["hypothesis"] == native_action.get("hypothesis", "")
+                if action["notes"]:
+                    assert action["notes"] == native_action.get("text", "")
+                if "answers" in action:
+                    assert action["answers"] == native_action["answers"]
+                else:
+                    assert action["experiment"] == native_action.get("strip", "")
         for event in events[:-1]:
             assert event["visibility"] == "private"
             assert (
@@ -227,17 +250,30 @@ for mode in (
                     applied_text_changes += 1
                 elif attempt["accepted"]:
                     assert attempt["parsed_action"] == event["executed_action"]
-                    if json.loads(attempt["response"]) != attempt["parsed_action"]:
+                    raw_text = attempt["response"]
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text.split("\n", 1)[1].rsplit("\n```", 1)[0]
+                    if json.loads(raw_text) != attempt["parsed_action"]:
                         normalized_proposals += 1
                         assert mode == "normalized" and event["seat"] == "0"
                 else:
                     assert attempt["rejection_reason"]
-            if mode in {"invalid", "provider-error"} and event["seat"] == "0":
-                assert (
-                    event["action_status"] == "fallback"
-                    and event["selected_attempt_id"] is None
-                )
-                assert len(event["attempts"]) == 2
+            if mode == "invalid":
+                assert event["selected_attempt_id"] is None
+                assert event["executed_action"] is None
+                assert event["fallback_origin"] is None
+                if event["seat"] == "0":
+                    assert event["action_status"] == "rejected"
+                    assert len(event["attempts"]) == 2
+                else:
+                    assert event["action_status"] == "missing"
+            elif mode == "provider-error":
+                assert event["selected_attempt_id"] is None
+                assert event["executed_action"] is None
+                assert event["fallback_origin"] is None
+                assert event["action_status"] == "missing"
+                if event["seat"] == "0":
+                    assert len(event["attempts"]) == 2
             elif mode == "applied-text" and event["seat"] == "0":
                 assert event["action_status"] == "rejected"
                 assert event["selected_attempt_id"] is None

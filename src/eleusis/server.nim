@@ -20,7 +20,7 @@
 ##                   {"type":"final","scores":[...],"rule":...,...}
 ##   player -> game: {"type":"prompt","prompt":"...","scripted":"openbook"}
 ##                   (max 4000 runes; scripted plays a built-in baseline for
-##                   that seat: "openbook" / "1", or "hoarder")
+##                   that seat: "openbook", "hoarder", or "freerider")
 ##   player -> game: {"type":"register","control":"external"}
 ##   game -> external player: {"type":"observation","id":N,
 ##                   "observation":<seat-private state and action inputs>}
@@ -54,6 +54,10 @@ type
     external: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
+    pendingErrors: seq[string]
+    pendingRejectedActions: seq[JsonNode]
+    failureSeat: int
+    failureReason: string
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -222,9 +226,12 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
       var participants = newJObject()
       for seat in 0 ..< Seats:
         participants[$seat] = %*{"score": results["scores"][seat]}
-      state.trajectory.finish(
-        (if results["reason"].getStr() == "complete": esCompleted else: esTruncated),
-        results, participants)
+      let episodeStatus =
+        case results["reason"].getStr()
+        of "complete": esCompleted
+        of "forfeit": esFailed
+        else: esTruncated
+      state.trajectory.finish(episodeStatus, results, participants)
 
     ## Send final frames to players BEFORE writing artifacts: the hosted
     ## worker tears player pods down as soon as results.json exists, and
@@ -252,6 +259,17 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   sleep(500)
   if not state.trajectory.isNil:
     state.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if state.failureSeat >= 0 and failureUri.len > 0:
+    let failurePayload = $ %*{
+      "seat": state.failureSeat,
+      "player": state.config.players[state.failureSeat].name,
+      "reason": state.failureReason
+    }
+    writeArtifact(
+      failureUri, failurePayload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
   echo "eleusis: writing results and replay"
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
@@ -353,6 +371,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         inc state.decisionId
         decisionId = state.decisionId
         state.pendingActions = newSeq[JsonNode](config.players.len)
+        state.pendingErrors = newSeq[string](config.players.len)
+        state.pendingRejectedActions = newSeq[JsonNode](config.players.len)
         for seat in seats:
           if external[seat] and state.playerSockets.hasKey(seat):
             state.playerSockets[seat].send($ %*{
@@ -365,139 +385,210 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           " at ", (epochTime() - gameStart).int, "s"
 
       let batchStart = epochTime()
-      ## The slow part (Claude, ONE parallel batch for all five seats) runs
-      ## outside the lock on a snapshot; only this thread mutates the sim, so
-      ## the snapshot cannot go stale.
-      var modelKinds = newSeq[ScriptKind](scripted.len)
-      for seat in 0 ..< scripted.len:
-        modelKinds[seat] = scripted[seat]
+      ## The slow part (Claude, ONE parallel batch for all non-external seats)
+      ## runs outside the lock on a snapshot; only this thread mutates the sim,
+      ## so the snapshot cannot go stale.
+      var internalSeats: seq[int]
       for seat in seats:
-        if external[seat]:
-          modelKinds[seat] = skOpenbook
-      var decisions = client.decideAll(simCopy, seats, prompts, modelKinds, state.selection)
-      let deadline = epochTime() + config.llmTimeoutSeconds.float
-      while epochTime() < deadline:
+        if not external[seat]:
+          internalSeats.add(seat)
+      let internalDecisions =
+        if internalSeats.len > 0:
+          client.decideAll(simCopy, internalSeats, prompts, scripted, state.selection)
+        else:
+          @[]
+      var decisions = newSeq[Decision](seats.len)
+      var internalPos = 0
+      for index, seat in seats:
+        if not external[seat]:
+          decisions[index] = internalDecisions[internalPos]
+          inc internalPos
+
+      let waitDeadline = epochTime() + config.llmTimeoutSeconds.float
+      while epochTime() < waitDeadline:
         var ready = true
         withLock stateLock:
           for seat in seats:
             if external[seat] and state.playerSockets.hasKey(seat) and
-                state.pendingActions[seat].isNil:
+                state.pendingActions[seat].isNil and
+                state.pendingErrors[seat].len == 0:
               ready = false
         if ready:
           break
         sleep(20)
+
       for index, seat in seats:
         if external[seat]:
           var action: JsonNode
+          var errMsg: string
+          var rejectedAction: JsonNode
           withLock stateLock:
             action = state.pendingActions[seat]
-          if not action.isNil:
-            decisions[index] = parseDecision(action,
-              simCopy.config.testStrips, testing)
+            errMsg = state.pendingErrors[seat]
+            rejectedAction = state.pendingRejectedActions[seat]
+          if errMsg.len > 0:
+            var evidence = newDecisionAttempt($decisionId & "-" & $seat & "-external",
+              "external", aoUnknown)
+            let system = systemPrompt(simCopy, seat, state.selection)
+            let user = userPrompt(simCopy, seat, prompts[seat])
+            evidence.prompt = %*[{"role": "system", "content": system}, {"role": "user", "content": user}]
+            if not rejectedAction.isNil:
+              evidence.response = %($rejectedAction)
+            evidence.accepted = false
+            evidence.rejectionReason = some(errMsg)
+            decisions[index].attempts.add(evidence)
+            decisions[index].failed = true
+            decisions[index].failureReason = errMsg
+          elif action.isNil:
+            decisions[index].failed = true
+            decisions[index].failureReason = "external player did not submit an action"
+          else:
+            try:
+              decisions[index] = parseDecision(action,
+                simCopy.config.testStrips, testing)
+            except CatchableError as error:
+              var evidence = newDecisionAttempt($decisionId & "-" & $seat & "-external",
+                "external", aoUnknown)
+              evidence.response = %($action)
+              evidence.accepted = false
+              evidence.rejectionReason = some(error.msg)
+              decisions[index].attempts.add(evidence)
+              decisions[index].failed = true
+              decisions[index].failureReason = error.msg
 
+      var batchForfeited = false
       withLock stateLock:
+        var failedSeat = -1
+        var failedReason = ""
         for index, seat in seats:
-          let decision = decisions[index]
-          var installed = decision
-          var applied = false
-          var fallbackUsed = false
-          ## A decision the LLM never delivered is a scripted move, and it is
-          ## recorded as one: `scripted` true and `fallback` true on the event.
-          let wasScripted =
-            client.playsScripted(prompts[seat], scripted[seat]) or
-            decision.fallback
-          let externalAction = external[seat] and not state.pendingActions[seat].isNil
-          try:
+          if decisions[index].failed:
+            failedSeat = seat
+            failedReason = decisions[index].failureReason
+            break
+        if failedSeat < 0:
+          ## Validate every seat's decision against the sim before mutating state
+          ## so a rejected reply forfeits cleanly without half-applying the round.
+          var probe = state.sim
+          for index, seat in seats:
+            let decision = decisions[index]
+            let wasScripted =
+              (not external[seat]) and client.playsScripted(prompts[seat], scripted[seat])
+            try:
+              if testing:
+                probe.applyAnswers(seat, decision.answers, decision.publish,
+                  decision.hypothesis, decision.notes, wasScripted)
+              else:
+                probe.applyResearch(seat, decision.strip, decision.publish,
+                  decision.hypothesis, decision.notes, wasScripted)
+            except CatchableError as error:
+              decisions[index].failed = true
+              decisions[index].failureReason = error.msg
+              for evidence in decisions[index].attempts.mitems:
+                if evidence.accepted:
+                  evidence.accepted = false
+                  evidence.rejectionReason = some(error.msg)
+              decisions[index].selectedAttemptId = none(string)
+              failedSeat = seat
+              failedReason = error.msg
+              break
+
+        if failedSeat >= 0:
+          batchForfeited = true
+          state.failureSeat = failedSeat
+          state.failureReason = failedReason
+          echo "eleusis: seat ", failedSeat, " forfeited (", failedReason,
+            "); ending episode"
+          state.sim.endEarly("forfeit")
+          if not state.trajectory.isNil:
+            for index, seat in seats:
+              var observation = decisionView(simCopy, seat, true)
+              let system = systemPrompt(simCopy, seat, state.selection)
+              let user = userPrompt(simCopy, seat, prompts[seat])
+              observation["prompt_template"] = state.selection.promptMetadata(system, user)
+              observation["prompt_attempts"] = newJArray()
+              var attempts = decisions[index].attempts
+              var hadReply = false
+              for evidence in attempts.mitems:
+                if evidence.response.kind != JNull:
+                  hadReply = true
+                if not decisions[index].failed and evidence.accepted:
+                  evidence.accepted = false
+                  evidence.rejectionReason = some("turn aborted by seat " & $failedSeat & " forfeit")
+              for evidence in attempts:
+                if evidence.prompt.kind == JArray and evidence.prompt.len == 2:
+                  observation["prompt_attempts"].add(%*{"attempt_id": evidence.attemptId,
+                    "prompt_template": state.selection.promptMetadata(
+                      evidence.prompt[0]["content"].getStr(), evidence.prompt[1]["content"].getStr())})
+              let status =
+                if decisions[index].failed and hadReply: asRejected
+                else: asMissing
+              state.trajectory.recordDecision($decisionId & "-" & $seat, $seat,
+                observation, attempts, none(string),
+                newJNull(), status, terminal = true, fallbackOrigin = none(string))
+          state.broadcastLocked()
+        else:
+          for index, seat in seats:
+            let decision = decisions[index]
+            let wasScripted =
+              (not external[seat]) and client.playsScripted(prompts[seat], scripted[seat])
+            let externalAction = external[seat]
             if testing:
               state.sim.applyAnswers(seat, decision.answers, decision.publish,
-                decision.hypothesis, decision.notes,
-                wasScripted and not externalAction,
-                decision.fallback)
+                decision.hypothesis, decision.notes, wasScripted)
             else:
               echo "eleusis: ", state.sim.names[seat], " tests ",
                 (if decision.strip.len > 0: decision.strip else: "(nothing)"),
                 (if decision.publish: " and publishes" else: " and hoards")
               state.sim.applyResearch(seat, decision.strip, decision.publish,
-                decision.hypothesis, decision.notes,
-                wasScripted and not externalAction,
-                decision.fallback)
-            applied = true
-          except CatchableError as error:
-            fallbackUsed = true
-            for evidence in installed.attempts.mitems:
-              if evidence.accepted:
-                evidence.accepted = false
-                evidence.rejectionReason = some(error.msg)
-            installed.selectedAttemptId = none(string)
-            echo "eleusis: reply rejected (", error.msg,
-              "); using scripted fallback"
-            ## Degrade, never hang: if even the fallback is refused the turn
-            ## simply stays open and the play deadline settles the episode.
-            try:
-              let fallback = scriptedAction(simCopy, seat, skOpenbook)
-              let attempts = installed.attempts
-              installed = fallback
-              installed.notes = ""
-              installed.attempts = attempts
-              if testing:
-                state.sim.applyAnswers(seat, fallback.answers,
-                  fallback.publish, fallback.hypothesis, "", true, true)
-              else:
-                state.sim.applyResearch(seat, fallback.strip,
-                  fallback.publish, fallback.hypothesis, "", true, true)
-              applied = true
-            except CatchableError as inner:
-              echo "eleusis: scripted fallback refused too: ", inner.msg
-          if not state.trajectory.isNil:
-            var observation = decisionView(simCopy, seat, true)
-            let system = systemPrompt(simCopy, seat, state.selection)
-            let user = userPrompt(simCopy, seat, prompts[seat])
-            observation["prompt_template"] = state.selection.promptMetadata(system, user)
-            observation["prompt_attempts"] = newJArray()
-            var executed = if applied: decisionJson(installed, testing) else: newJNull()
-            if applied:
-              if installed.hypothesis.len > 0:
+                decision.hypothesis, decision.notes, wasScripted)
+            if not state.trajectory.isNil:
+              var observation = decisionView(simCopy, seat, true)
+              let system = systemPrompt(simCopy, seat, state.selection)
+              let user = userPrompt(simCopy, seat, prompts[seat])
+              observation["prompt_template"] = state.selection.promptMetadata(system, user)
+              observation["prompt_attempts"] = newJArray()
+              var executed = decisionJson(decision, testing)
+              if decision.hypothesis.len > 0:
                 executed["hypothesis"] = %state.sim.seats[seat].hypothesis
-              if installed.notes.len > 0:
+              if decision.notes.len > 0:
                 executed["notes"] = %state.sim.seats[seat].notes
-            var attempts = installed.attempts
-            var selected = installed.selectedAttemptId
-            var status = if applied: asFallback else: asMissing
-            var fallback = if applied: some("engine-openbook") else: none(string)
-            if applied and not fallbackUsed and not decision.fallback:
+              var attempts = decision.attempts
+              var selected = decision.selectedAttemptId
+              var status = asAccepted
+              if selected.isNone:
+                if externalAction or scripted[seat] != skNone:
+                  var evidence = newDecisionAttempt($decisionId & "-" & $seat & "-applied",
+                    (if externalAction: "external" else: $scripted[seat]),
+                    (if externalAction: aoUnknown else: aoTeacher))
+                  evidence.prompt = %*[{"role": "system", "content": system}, {"role": "user", "content": user}]
+                  evidence.response = %($decisionJson(decision, testing))
+                  evidence.parsedAction = decisionJson(decision, testing)
+                  evidence.accepted = true
+                  attempts.add(evidence)
+                  selected = some(evidence.attemptId)
+                else:
+                  status = asFallback
               if selected.isSome:
-                status = asAccepted
-                fallback = none(string)
-              elif externalAction or scripted[seat] != skNone:
-                var evidence = newDecisionAttempt($decisionId & "-" & $seat & "-applied",
-                  (if externalAction: "external" else: $scripted[seat]),
-                  (if externalAction: aoUnknown else: aoTeacher))
-                evidence.prompt = %*[{"role": "system", "content": system}, {"role": "user", "content": user}]
-                evidence.response = %($decisionJson(installed, testing))
-                evidence.parsedAction = decisionJson(installed, testing)
-                evidence.accepted = true
-                attempts.add(evidence)
-                selected = some(evidence.attemptId)
-                status = asAccepted
-                fallback = none(string)
-            if selected.isSome:
-              let selectedId = selected.get()
-              for evidence in attempts.mitems:
-                if evidence.attemptId == selectedId and evidence.parsedAction != executed:
-                  evidence.accepted = false
-                  evidence.rejectionReason = some("simulator normalized the applied action")
-                  selected = none(string)
-                  status = asRejected
-                  fallback = none(string)
-            for evidence in attempts:
-              if evidence.prompt.kind == JArray and evidence.prompt.len == 2:
-                observation["prompt_attempts"].add(%*{"attempt_id": evidence.attemptId,
-                  "prompt_template": state.selection.promptMetadata(
-                    evidence.prompt[0]["content"].getStr(), evidence.prompt[1]["content"].getStr())})
-            state.trajectory.recordDecision($decisionId & "-" & $seat, $seat,
-              observation, attempts, selected,
-              executed, status, terminal = state.sim.done, fallbackOrigin = fallback)
-        state.broadcastLocked()
+                let selectedId = selected.get()
+                for evidence in attempts.mitems:
+                  if evidence.attemptId == selectedId and evidence.parsedAction != executed:
+                    evidence.accepted = false
+                    evidence.rejectionReason = some("simulator normalized the applied action")
+                    selected = none(string)
+                    status = asRejected
+              for evidence in attempts:
+                if evidence.prompt.kind == JArray and evidence.prompt.len == 2:
+                  observation["prompt_attempts"].add(%*{"attempt_id": evidence.attemptId,
+                    "prompt_template": state.selection.promptMetadata(
+                      evidence.prompt[0]["content"].getStr(), evidence.prompt[1]["content"].getStr())})
+              let fallback = if status == asFallback: some("engine-openbook") else: none(string)
+              state.trajectory.recordDecision($decisionId & "-" & $seat, $seat,
+                observation, attempts, selected,
+                executed, status, terminal = state.sim.done, fallbackOrigin = fallback)
+          state.broadcastLocked()
+
+      if batchForfeited:
+        break
 
       ## Floor the wall-clock gap between the STARTS of consecutive batches:
       ## the hosted Bedrock sidecar caps an episode at 30 requests/minute and
@@ -635,23 +726,36 @@ proc websocketHandler(
           return
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
-            if state.external[slot] and payload["id"].getInt() ==
-                state.decisionId and state.pendingActions[slot].isNil:
-              let action = payload["action"]
+            if state.external[slot] and payload{"id"}.getInt(-1) ==
+                state.decisionId and state.pendingActions[slot].isNil and
+                state.pendingErrors[slot].len == 0:
+              let action = payload{"action"}
               let testing = state.sim.phase == phTest
-              let decision = parseDecision(action,
-                state.sim.config.testStrips, testing)
-              var probe = state.sim
-              if testing:
-                probe.applyAnswers(slot, decision.answers, decision.publish,
-                  decision.hypothesis, decision.notes, false)
-              else:
-                probe.applyResearch(slot, decision.strip, decision.publish,
-                  decision.hypothesis, decision.notes, false)
-              state.pendingActions[slot] = action
+              try:
+                let decision = parseDecision(action,
+                  state.sim.config.testStrips, testing)
+                var probe = state.sim
+                if testing:
+                  probe.applyAnswers(slot, decision.answers, decision.publish,
+                    decision.hypothesis, decision.notes, false)
+                else:
+                  probe.applyResearch(slot, decision.strip, decision.publish,
+                    decision.hypothesis, decision.notes, false)
+                state.pendingActions[slot] = action
+              except CatchableError as error:
+                state.pendingErrors[slot] = error.msg
+                state.pendingRejectedActions[slot] = action
+                websocket.send($ %*{
+                  "type": "rejected",
+                  "id": state.decisionId,
+                  "reason": error.msg
+                })
           return
         if payload{"type"}.getStr() == "prompt":
-          var prompt = payload{"prompt"}.getStr()
+          let promptNode = payload{"prompt"}
+          if not promptNode.isNil and promptNode.kind != JString:
+            raise newException(EleusisError, "prompt must be a string")
+          var prompt = if promptNode.isNil: "" else: promptNode.getStr()
           ## Cut on a rune boundary: a byte slice through a multi-byte
           ## character leaves invalid UTF-8 in the prompt and the replay.
           if prompt.runeLen > MaxPromptLen:
@@ -659,8 +763,8 @@ proc websocketHandler(
           let node = payload{"scripted"}
           let scripted =
             if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skOpenbook
-              else: skNone)
+            elif node.kind != JString:
+              raise newException(EleusisError, "scripted must be a string")
             else: parseScriptKind(node.getStr())
           withLock stateLock:
             state.prompts[slot] = prompt
@@ -749,6 +853,10 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.scripted = newSeq[ScriptKind](config.players.len)
   state.external = newSeq[bool](config.players.len)
   state.pendingActions = newSeq[JsonNode](config.players.len)
+  state.pendingErrors = newSeq[string](config.players.len)
+  state.pendingRejectedActions = newSeq[JsonNode](config.players.len)
+  state.failureSeat = -1
+  state.failureReason = ""
   runtimeConfigGlobal = runtimeConfig
   if getEnv(CogameSaveTrajectoryUriEnv).len > 0:
     state.trajectory = newDecisionTrajectory(getEnv("COWORLD_EPISODE_ID"),

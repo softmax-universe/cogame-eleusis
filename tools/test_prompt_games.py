@@ -100,18 +100,18 @@ def play(variant, seed, wording="canonical", prompt_seed=0, normalize=False):
             if normalize:
                 proposal["notes"] = marker * 650
                 proposal["hypothesis"] = f"public-{seat}-" + "x" * 150
-                proposal["publish"] = str(proposal["publish"]).lower()
                 if testing:
                     proposal["answers"] = [
                         answer.upper() for answer in proposal["answers"]
                     ]
-                else:
-                    proposal["experiment"] = proposal["experiment"].lower()
+                response_text = "```json\n" + json.dumps(proposal) + "\n```"
+            else:
+                response_text = json.dumps(proposal)
             accepted = request(
                 {
                     "kind": "step",
                     "decision_id": observation["decision_id"],
-                    "response": json.dumps(proposal),
+                    "response": response_text,
                 }
             )
             assert accepted["kind"] == "accepted"
@@ -125,7 +125,7 @@ def play(variant, seed, wording="canonical", prompt_seed=0, normalize=False):
                         answer.lower() for answer in proposal["answers"]
                     ]
                 else:
-                    assert action["experiment"] == proposal["experiment"].upper()
+                    assert action["experiment"] == proposal["experiment"]
             else:
                 assert action == proposal
             projection = {"publish": action["publish"]}
