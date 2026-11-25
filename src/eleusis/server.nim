@@ -217,7 +217,9 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
 proc abortEpisode(runtimeConfig: RuntimeConfig) =
   ## Terminates an unfinished episode unscored with attributable diagnostics.
   ## Never writes authoritative scores (results.json) or a synthetic replay.
-  ## Writes COGAME_PLAYER_FAILURE_URI ONLY for player-attributable failures.
+  ## Writes COGAME_PLAYER_FAILURE_URI using Coworld's closed GamePlayerFailure
+  ## schema (failed_policy_index, message, kind) for both player_error and
+  ## episode_inconclusive interruptions.
   var failureSeat = -1
   var failureKind = fkNone
   var failureReason = ""
@@ -260,11 +262,18 @@ proc abortEpisode(runtimeConfig: RuntimeConfig) =
   if not state.trajectory.isNil:
     state.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
-  if failureKind == fkPlayer and failureSeat >= 0 and failureUri.len > 0:
+  if failureKind != fkNone and failureSeat >= 0 and failureUri.len > 0:
+    let kindStr =
+      if failureKind == fkPlayer: "player_error"
+      else: "episode_inconclusive"
+    let msg =
+      if failureReason.strip().len > 0: cleanText(failureReason, 2000)
+      elif failureKind == fkPlayer: "player decision failed"
+      else: "episode interrupted by infrastructure failure"
     let failurePayload = $ %*{
-      "seat": failureSeat,
-      "player": failurePlayer,
-      "reason": failureReason
+      "failed_policy_index": failureSeat,
+      "message": msg,
+      "kind": kindStr
     }
     writeArtifact(
       failureUri, failurePayload, "application/json",
