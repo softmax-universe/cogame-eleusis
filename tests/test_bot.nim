@@ -240,19 +240,32 @@ suite "scripted baselines":
     for badScript in ["1", "true", "yes", "open-book", "open", "secretive", "free-rider", "typo"]:
       expect EleusisError:
         discard parseScriptKind(badScript)
-    ## JSON extraction: bare object or single ordinary outer markdown code fence only.
+    ## JSON extraction: bare object or single ordinary outer markdown code fence
+    ## (closed, or unclosed when the fenced body is a complete JSON object).
     check extractJsonObject("""{"experiment": "RBGY"}"""){"experiment"}.getStr() == "RBGY"
     check extractJsonObject("```\n{\"experiment\": \"RBGY\"}\n```"){"experiment"}.getStr() == "RBGY"
     check extractJsonObject("```json\n{\"experiment\": \"RBGY\"}\n```"){"experiment"}.getStr() == "RBGY"
     check extractJsonObject("```JSON\n{\"experiment\": \"RBGY\"}\n```"){"experiment"}.getStr() == "RBGY"
+    check extractJsonObject("```\n{\"experiment\": \"RBGY\"}"){"experiment"}.getStr() == "RBGY"
+    check extractJsonObject("```json\n{\"experiment\": \"RBGY\"}"){"experiment"}.getStr() == "RBGY"
+    check extractJsonObject("```JSON\n{\n  \"experiment\": \"RBGY\",\n  \"publish\": false\n}\n"){"experiment"}.getStr() == "RBGY"
     for badReply in [
       "prose {\"experiment\": \"RBGY\"} tail",
       "Here is my move:\n```json\n{\"experiment\": \"RBGY\"}\n```",
       "```json\n{\"experiment\": \"RBGY\"}\n```\nDone.",
+      "```json\n{\"experiment\": \"RBGY\"}\nDone.",
       "{\"experiment\": \"RBGY\"} {\"experiment\": \"RRRR\"}",
+      "```json\n{\"experiment\": \"RBGY\"} {\"experiment\": \"RRRR\"}",
+      "```json\n{\"experiment\": \"RBGY\"}\n```\n{\"experiment\": \"RRRR\"}",
       "```json\n{\"experiment\": \"RBGY\"}\n```\n```json\n{\"experiment\": \"RRRR\"}\n```",
       "```python\n{\"experiment\": \"RBGY\"}\n```",
-      "```json\n{\"experiment\": \"RBGY\"}",
+      "```python\n{\"experiment\": \"RBGY\"}",
+      "```json\n{\"experiment\": \"RBGY\"}```",
+      "```json\n{\"experiment\": \"RBGY\"}\n``",
+      "```json\n{\"experiment\": \"RBGY\", \"notes\": \"cut off",
+      "```json\n{\"experiment\": \"RBGY\", \"nested\": {\"a\": 1}",
+      "```json\n{\"experiment\": \"RBGY\", \"publish\":}",
+      "```json",
       "[1, 2]",
       ""
     ]:

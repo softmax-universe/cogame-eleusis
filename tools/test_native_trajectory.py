@@ -18,6 +18,7 @@ OUTPUT.mkdir(parents=True, exist_ok=False, mode=0o700)
 for mode in (
     "accepted",
     "invalid",
+    "truncated-fence",
     "double-object",
     "provider-429",
     "provider-503",
@@ -55,10 +56,14 @@ for mode in (
                 action["hypothesis"] = "fixture\rprivate"
             if mode == "invalid" and seat == 0:
                 text = "not JSON"
+            elif mode == "truncated-fence" and seat == 0:
+                text = "```json\n" + json.dumps(action)[:-1]
             elif mode == "double-object" and seat == 0:
                 text = json.dumps(action) + " " + json.dumps(action)
             elif mode == "accepted" and seat == 0:
                 text = "```json\n" + json.dumps(action) + "\n```"
+            elif mode == "accepted" and seat == 1:
+                text = "```json\n" + json.dumps(action)
             else:
                 text = json.dumps(action)
             body = {
@@ -145,8 +150,8 @@ for mode in (
     else:
         env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{provider.server_port}"
         env["COWORLD_LLM_MODEL"] = "fixture/requested"
-    failed_modes = {"invalid", "double-object", "provider-429", "provider-503", "provider-error", "missing-credentials"}
-    player_fail_modes = {"invalid", "double-object"}
+    failed_modes = {"invalid", "truncated-fence", "double-object", "provider-429", "provider-503", "provider-error", "missing-credentials"}
+    player_fail_modes = {"invalid", "truncated-fence", "double-object"}
     infra_fail_modes = {"provider-429", "provider-503", "provider-error", "missing-credentials"}
     expected_fail_seat = 2 if mode == "provider-503" else 0
     processes = []

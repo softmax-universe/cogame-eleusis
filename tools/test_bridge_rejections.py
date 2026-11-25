@@ -36,6 +36,8 @@ try:
             '{"experiment":"rb gy","publish":false}',
             '{"experiment":"RBGY","publish":"yes"}',
             '{"answers":[true,false,true,false,true,false],"publish":false}',
+            '```json\n' + teacher[:-1],
+            '```json\n' + teacher + ' ' + teacher,
         ]:
             rejected = request({'kind': 'step', 'decision_id': observation['decision_id'], 'response': invalid})
             assert rejected['kind'] == 'rejected' and rejected['reason']
@@ -47,7 +49,7 @@ try:
         decisions += 1
     assert set(observation['scores']) == {str(s) for s in range(players)}
     assert decisions == 140 if name == 'eleusis' else 1 <= decisions <= 80
-    print(name, decisions, 'completed decisions,', decisions * 9, 'state-preserving rejections')
+    print(name, decisions, 'completed decisions,', decisions * 11, 'state-preserving rejections')
 finally:
     process.stdin.close()
     try:

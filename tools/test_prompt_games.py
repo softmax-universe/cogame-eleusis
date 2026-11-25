@@ -104,7 +104,11 @@ def play(variant, seed, wording="canonical", prompt_seed=0, normalize=False):
                     proposal["answers"] = [
                         answer.upper() for answer in proposal["answers"]
                     ]
-                response_text = "```json\n" + json.dumps(proposal) + "\n```"
+                response_text = (
+                    "```json\n" + json.dumps(proposal)
+                    if seat % 2 == 1
+                    else "```json\n" + json.dumps(proposal) + "\n```"
+                )
             else:
                 response_text = json.dumps(proposal)
             accepted = request(
